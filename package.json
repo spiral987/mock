@@ -1,0 +1,26 @@
+{
+  "name": "mock",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "レイヤー型キャンバスエディタ。決定的な操作ログ（replay 可能）ベースの描画エンジンと Tool UI を持つ素の土台。フォルダ／クリッピングに対応。",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ag-psd": "^31.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  }
+}
