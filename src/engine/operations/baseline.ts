@@ -35,6 +35,8 @@ interface SerializedGroup {
   opacity: number;
   collapsed: boolean;
   children: SerializedNode[];
+  /** 差分スタック（横軸）なら、いま出ている差分の位置。落とすと全差分が重なって出てしまう。 */
+  variantIndex?: number;
 }
 type SerializedNode = SerializedLayer | SerializedGroup;
 
@@ -53,6 +55,7 @@ function serializeNode(n: LayerNode): SerializedNode {
       opacity: n.opacity,
       collapsed: n.collapsed,
       children: n.children.map(serializeNode),
+      ...(n.variantIndex !== undefined ? { variantIndex: n.variantIndex } : {}),
     };
   }
   return {
@@ -78,6 +81,7 @@ function deserializeNode(s: SerializedNode): LayerNode {
       opacity: s.opacity,
       collapsed: s.collapsed,
       children: s.children.map(deserializeNode),
+      ...(s.variantIndex !== undefined ? { variantIndex: s.variantIndex } : {}),
     };
     return g;
   }

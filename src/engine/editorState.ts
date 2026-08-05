@@ -1,5 +1,5 @@
-import type { EditorState, Layer, LayerNode } from '../types';
-import { createLayer, isGroup } from './layer';
+import type { EditorState, Layer, LayerGroup, LayerNode } from '../types';
+import { createLayer, isGroup, isVariantStack } from './layer';
 
 /** ルート状態のベースレイヤID。replay 時も同じIDで再構築されるよう固定する。 */
 export const BASE_LAYER_ID = 'layer-base';
@@ -51,6 +51,30 @@ export function getParentInfo(
     return null;
   };
   return search(state.layers, null);
+}
+
+/**
+ * ノードを含む「スロット」の親情報。差分スタック（横軸）の中に居るノードは、合成上は
+ * スタックの位置に居るのと同じなので、上下関係（クリップの下地・merge down の相手）を
+ * 見るときはスタック自身の親情報を返す。スタックの外に居るノードは getParentInfo と同じ。
+ */
+export function getSlotInfo(
+  state: EditorState,
+  id: string,
+): { parentId: string | null; siblings: LayerNode[]; index: number } | null {
+  const info = getParentInfo(state, id);
+  if (!info || info.parentId === null) return info;
+  const parent = getNode(state, info.parentId);
+  if (parent && isVariantStack(parent)) return getSlotInfo(state, parent.id);
+  return info;
+}
+
+/** そのノードを直接の差分として持つスタック（横軸に居なければ undefined）。 */
+export function getVariantStackOf(state: EditorState, id: string): LayerGroup | undefined {
+  const info = getParentInfo(state, id);
+  if (!info || info.parentId === null) return undefined;
+  const parent = getNode(state, info.parentId);
+  return parent && isVariantStack(parent) ? parent : undefined;
 }
 
 /** id に一致する任意のノード（リーフ or グループ）を探す。 */

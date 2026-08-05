@@ -1,6 +1,6 @@
 import type { EditorState, ImageBuffer, Layer, LayerNode } from '../types';
 import { createImageBuffer } from './imageBuffer';
-import { isGroup } from './layer';
+import { isGroup, isVariantStack, resolveSlot } from './layer';
 
 export interface FlattenOptions {
   /** 背景色 RGBA(0..255)。既定は不透明白（エディタ表示と一致）。 */
@@ -47,7 +47,8 @@ function fillRGBA(data: Uint8ClampedArray, r: number, g: number, b: number, a: n
  * マスクして重ねる。下地の直上に連続する clipped 群は同じ下地にクリップする（Photoshop 準拠）。
  * 下地はリーフでもフォルダでもよい（フォルダの場合は合成後アルファをマスクに使う）。
  */
-function compositeNodes(out: ImageBuffer, nodes: LayerNode[], width: number, height: number): void {
+function compositeNodes(out: ImageBuffer, rawNodes: LayerNode[], width: number, height: number): void {
+  const nodes = resolveVariants(rawNodes);
   let i = 0;
   while (i < nodes.length) {
     const base = nodes[i];
@@ -78,6 +79,22 @@ function compositeNodes(out: ImageBuffer, nodes: LayerNode[], width: number, hei
       compositeLayer(out, fullCanvasLayer(tmp));
     }
   }
+}
+
+/**
+ * 差分スタック（横軸）を解決し、「いまそこに在るノード」だけの列にする。
+ * スタックを active な差分そのものへ置き換えるので、クリッピングの下地判定も z 順も
+ * 「その差分が直接その位置に居る」場合と完全に同じ規則で働く（横軸は合成規則を増やさない）。
+ * スロットごと非表示（stack.visible=false）なら列から落ちる。
+ */
+function resolveVariants(nodes: LayerNode[]): LayerNode[] {
+  if (!nodes.some(isVariantStack)) return nodes; // 横軸なしが通常。配列を作り直さない。
+  const out: LayerNode[] = [];
+  for (const n of nodes) {
+    const slot = resolveSlot(n);
+    if (slot) out.push(slot);
+  }
+  return out;
 }
 
 /** 1ノード（リーフ or フォルダ）を out に合成する。フォルダは子を独立バッファへ合成してから重ねる。 */

@@ -83,10 +83,47 @@ export interface LayerGroup {
   opacity: number; // 0..1
   collapsed: boolean; // UI 表示の折りたたみ（描画には影響しない）
   children: LayerNode[];
+  /**
+   * このグループを「差分スタック」＝レイヤーの横軸として扱う。
+   * 設定されていれば children は上下(z順)ではなく左右に並ぶ相互排他な差分(variants)で、
+   * 合成に参加するのは children[variantIndex] の 1 つだけ。他の差分は「そこに無い」ものとして
+   * 扱われる（横に並んだレイヤーは互いに独立にしか存在しない、という関係）。
+   * UI では 1 行に畳まれ、左右スライド／‹ › で並列の差分へ切り替える。
+   * 省略時は通常のフォルダ（＝縦軸だけ）。値は常に children の範囲内へクランプして解釈する。
+   *
+   * スタック自身は「スロット」を表す純粋な容れ物なので visible=true / opacity=1 を保つ
+   * （表示・不透明度・名前・クリップは、今そこに出ている差分レイヤー側が持つ）。
+   * 合成では visible=false / opacity<=0 のときだけスロットごと非表示として扱い、
+   * 中間の不透明度は使わない。
+   *
+   * 【不変条件】横軸の中に横軸は置かない（差分の差分を作らない）。
+   * 入れ子 [[A|B]|C] は合成結果が平らな [A|B|C] と完全に一致し、増えるのは「グループ内で
+   * どれを選んでいたかの記憶」だけ。表現力は増えないのに、1 次元のレイヤー一覧に階層を
+   * 描く必要が生まれて読みにくくなるので、スロットへスロットを入れる操作は中身を平らに混ぜる
+   * （moveNode / moveAsVariant / addVariant がこれを保証する）。
+   * 縦軸(フォルダ)との入れ子は許す: 差分の中にフォルダ（＝この案は複数枚でできている）、
+   * フォルダの中に差分（＝このグループのここだけが変わる）はどちらも必要な形。
+   */
+  variantIndex?: number;
 }
 
 /** レイヤーツリーのノード = リーフ(Layer) または フォルダ(LayerGroup)。 */
 export type LayerNode = Layer | LayerGroup;
+
+/**
+ * 選択範囲マスク（投げ縄選択などで作る「描ける場所」の限定）。
+ * キャンバス座標の矩形 (x,y,w,h) に対し、画素ごとの被覆率 0..255 を持つ（アンチエイリアス付き）。
+ * bbox の外は被覆 0（＝選択外）。レイヤーではなくドキュメントに 1 つだけ持つ。
+ *
+ * 状態の一部なので、log から決定的に再構築できる（setSelection op が path から同じマスクを焼き直す）。
+ */
+export interface SelectionMask {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  data: Uint8Array; // 長さ = w*h。被覆率 0..255
+}
 
 /** エディタの完全な状態。replay により log から決定的に再構築できる。 */
 export interface EditorState {
@@ -94,4 +131,9 @@ export interface EditorState {
   height: number;
   layers: LayerNode[]; // 下から上（layers[0] が最背面）。フォルダで階層化される。
   activeLayerId: string;
+  /**
+   * 選択範囲（null/省略 = 選択なし＝どこにでも描ける）。ブラシ・消しゴム・塗りつぶし・投げ縄塗りは
+   * ここが非 null のとき被覆率を掛けて書き込むので、選択の外には一切触れない。
+   */
+  selection?: SelectionMask | null;
 }

@@ -101,8 +101,10 @@ body {
   width: 270px;
 }
 
+/* 差分スロット行は「開閉 + サムネ + 名前 + ‹ n/m › + 各ボタン」と要素が多いので、
+   ツールパネルより少し広く取る（それでも足りなければ枠を掴んでリサイズできる）。 */
 .float-layers {
-  width: 270px;
+  width: 300px;
 }
 
 .float-bottom {
@@ -425,6 +427,16 @@ body {
   background: #fff;
 }
 
+/* 選択範囲の点線・投げ縄のプレビューを描く重ね canvas。絵の canvas と同じ位置・同じ画素サイズで
+   重ね、当たり判定は持たない（pointer は下の edit-canvas がすべて受ける）。 */
+.selection-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
 /* 辺リサイズ・ハンドル（右辺=幅 / 下辺=高さ）。canvas-stage 内（pan 追従・scale の外）に置き、
    位置は辺の中点。掴んで引っ張るとサイズが変わる（離すと1操作で確定）。 */
 .resize-handle {
@@ -727,6 +739,111 @@ body {
   margin-bottom: 10px;
 }
 
+/* ---- ツールパレット（役割ごとの小見出し + アイコングリッド） ---- */
+.tool-group {
+  margin-bottom: 8px;
+}
+
+.tool-group-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+/* 見出しの右に区切り線を伸ばして、グループの切れ目を目で追えるようにする。 */
+.tool-group-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+  gap: 5px;
+}
+
+.tool-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1;
+  padding: 0;
+  color: var(--text);
+}
+
+.tool-btn .tool-icon {
+  display: block;
+}
+
+/* ショートカットキーは右下に小さく。アイコンの邪魔をしない程度に薄く出す。 */
+.tool-btn-key {
+  position: absolute;
+  right: 3px;
+  bottom: 2px;
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.tool-btn.active {
+  color: #0c1220;
+}
+.tool-btn.active .tool-btn-key {
+  opacity: 0.65;
+}
+
+/* いま選んでいるツール名。アイコンだけだと初見で分からないので、1行だけ文字でも出す。 */
+.tool-current {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  margin: 2px 0 10px;
+}
+
+/* 選択範囲があるときだけ出る状態バー。 */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 5px 8px;
+  border: 1px solid #3f5d7a;
+  border-radius: 6px;
+  background: rgba(86, 204, 242, 0.09);
+  color: #9fd8f2;
+  font-size: 11px;
+}
+
+.selection-bar-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.selection-bar .icon-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Undo/Redo など、アイコンと文字を並べるボタンの縦位置を揃える。 */
+.tool-row button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
 /* 数回クリックで確定する破壊的ボタン（ConfirmButton）の armed 表示。 */
 .confirm-arming {
   background: #3a1717 !important;
@@ -779,6 +896,47 @@ button.active {
   width: 100%;
 }
 
+/* ツールプロパティ（TOOLS セクション下部）: いま選んでいる筆の質感スライダー群。
+   本体のツール設定と混ざらないよう、区切り線＋一段沈んだ背景で囲う。 */
+.tool-props {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.tool-props-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.tool-props-head .icon-btn {
+  font-size: 11px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+/* スライダー行を詰めて、数が多くてもパネルが伸びすぎないようにする。 */
+.field.tool-prop {
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.field.tool-prop input[type='range'] {
+  height: 14px;
+}
+
+/* 効かない設定（ぼかし>0 のときの「縁の締まり」など）は薄く見せる。 */
+.field.tool-prop.off {
+  opacity: 0.4;
+}
+
 /* CANVAS セクション: サイズ表示・入力行 */
 .canvas-size-current {
   font-size: 12px;
@@ -819,6 +977,55 @@ button.active {
   padding: 0;
   border: 1px solid var(--border);
   background: none;
+}
+
+/* ---- メイン / サブ / 透明 の3枠 ---- */
+.color-slots {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.color-slot {
+  position: relative;
+  height: 46px;
+  padding: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+/* 選んでいる枠は明るい縁 + 外側のリングではっきり示す（背景色が何であっても見えるように）。 */
+.color-slot.active {
+  border-color: #fff;
+  box-shadow:
+    0 0 0 2px var(--accent),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+/* 名前は色の上に載るので、暗い帯を敷いてどんな色でも読めるようにする。 */
+.color-slot-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 0 3px;
+  font-size: 10px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+/* 透明枠は市松模様（＝そこには何も無い、を表す慣用表現）。 */
+.color-slot-transparent {
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, #b9bcc4 25%, transparent 25%, transparent 75%, #b9bcc4 75%),
+    linear-gradient(45deg, #b9bcc4 25%, transparent 25%, transparent 75%, #b9bcc4 75%);
+  background-size: 12px 12px;
+  background-position:
+    0 0,
+    6px 6px;
 }
 
 /* ---- Color picker（常時表示の色相環 + パレット） ---- */
@@ -1035,13 +1242,25 @@ button.active {
 .layer-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  cursor: grab; /* 行のどこでも掴んで移動できる（ボタン/名前は各自のカーソルで上書き） */
+  /* 要素数が多い行（差分スロット = 開閉 + サムネ + 各ボタン）でも名前の幅が残るよう詰める。 */
+  gap: 4px;
+  /* 行本体は「長押しで持ち上がる」ので即ドラッグの grab は出さない。掴む取っ手は ⠿ 側。 */
+  cursor: default;
   user-select: none; /* ドラッグ中に行テキストを選択しない */
-  touch-action: none; /* ペン/タッチでも行から並べ替えを開始できる（スクロールに奪われない） */
+  touch-action: none; /* ペン/タッチでも行からジェスチャを開始できる（スクロールに奪われない） */
 }
-.layer-head:active {
-  cursor: grabbing;
+
+/* 差分を持つ行は左右にスライドできる、とカーソルで示す。 */
+.layer-item.has-variants > .layer-head {
+  cursor: ew-resize;
+}
+
+/* 持ち上がった行。実体はその場に残り、ゴーストが指に付いてくるので、
+   「いま持ち上げているのはこれ」と分かるように沈めて枠を出す。 */
+.layer-item.lifted {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: var(--accent);
 }
 
 /* レイヤー D&D: つかむグリップとドロップ位置インジケータ */
@@ -1071,7 +1290,7 @@ button.active {
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
   font-size: 13px;
   opacity: 0.92;
-  max-width: 220px;
+  max-width: 320px; /* 「差分にする」バッジが付いても切れない幅 */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1102,6 +1321,47 @@ button.active {
   background: rgba(91, 157, 255, 0.18);
   outline: 1px solid var(--accent);
   outline-offset: -1px;
+}
+
+/* 横に並べる（差分にする）落とし先。縦の並べ替え（青い横線）と一目で区別できるよう、
+   差分スタックと同じ緑で、落ちる側の縁に「縦」棒を出す（軸が縦か横かを線の向きで示す）。 */
+.layer-item.drop-left::before,
+.layer-item.drop-right::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 3px;
+  background: #7ec7a8;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.layer-item.drop-left::before {
+  left: -4px;
+}
+
+.layer-item.drop-right::after {
+  right: -4px;
+}
+
+.layer-item.drop-left,
+.layer-item.drop-right {
+  background: rgba(126, 199, 168, 0.16);
+  outline: 1px solid rgba(126, 199, 168, 0.8);
+  outline-offset: -1px;
+}
+
+/* ドラッグ中のゴーストに出す「こう落ちる」ラベル。 */
+.drag-ghost-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  background: rgba(126, 199, 168, 0.22);
+  border: 1px solid rgba(126, 199, 168, 0.8);
+  color: #a8dcc4;
+  white-space: nowrap;
 }
 
 .layer-name {
@@ -1216,6 +1476,203 @@ button.active {
 /* クリッピング中のレイヤー行: 縁を落ち着いた赤に（警告色になりすぎない範囲で）。 */
 .layer-item.is-clipped {
   border-color: rgba(198, 116, 116, 0.75);
+}
+
+/* ---- レイヤーの横軸（差分スタック） ---------------------------------------
+   1 スロットに互いに排他な差分が左右に並ぶ行。左右にドラッグ（または ‹ ›）で
+   並列の差分が出てくる。「まだ横に何かある」ことを行の左右の縁で示す。 */
+.layer-item.has-variants {
+  border-color: rgba(126, 199, 168, 0.55);
+  background:
+    linear-gradient(90deg, rgba(126, 199, 168, 0.16), transparent 14px),
+    linear-gradient(270deg, rgba(126, 199, 168, 0.16), transparent 14px), var(--panel-2);
+}
+
+/* 差分を覗き見中（サムネイルにホバー中）は、どのスロットを見ているかを縁で示す。 */
+.layer-item.has-variants.peeking {
+  border-color: rgba(126, 199, 168, 0.95);
+}
+
+/* 開いたスロットの中身（横に並ぶ差分の一覧）。縦軸のフォルダと取り違えないよう、
+   区切り線も緑にして「これは横軸だ」と分かるようにする。 */
+.layer-list.nested.variants {
+  border-left: 2px solid rgba(126, 199, 168, 0.45);
+}
+
+.variant-list-cap {
+  list-style: none;
+  padding: 2px 4px 4px 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+/* 差分の1枚。控え（いま絵に載っていない方）は少し沈めて、出ている1枚を目立たせる。 */
+.layer-item.is-variant {
+  border-color: rgba(126, 199, 168, 0.3);
+}
+
+.layer-item.is-variant:not(.is-shown-variant) {
+  opacity: 0.72;
+}
+
+.layer-item.is-shown-variant {
+  border-color: rgba(126, 199, 168, 0.75);
+  background: rgba(126, 199, 168, 0.1);
+}
+
+/* 行に出す「n/m」。枚数と現在位置だけを示す（選ぶのは左右スライドのカルーセル）。 */
+.variant-count {
+  flex: none;
+  font-size: 10px;
+  color: rgb(146, 209, 182);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* 「いま出ている差分」の印。行幅を名前に回すため文字ではなく小さな点にする
+   （行の縁と背景でも示しているので、これは補助の目印）。 */
+.variant-badge {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.variant-badge.on {
+  background: #7ec7a8;
+  box-shadow: 0 0 0 2px rgba(126, 199, 168, 0.25);
+}
+
+/* ‹ n/m › のスライダー。行の他のボタンより一段静かに、でも数が読めるように。 */
+/* 左右スライド中だけ行の上に重なるカルーセル。行の高さと位置をそのまま使い、
+   レイアウトを一切動かさずに「その場で」サムネイルが並ぶ。 */
+.variant-carousel {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  overflow: hidden;
+  border-radius: 6px;
+  /* 不透明にして、下の行（名前・n/m・各ボタン）が透けて二重に見えないようにする。 */
+  background: #181a1e;
+  box-shadow: inset 0 0 0 1px rgba(126, 199, 168, 0.5);
+  pointer-events: none; /* 掴んでいるのは下の行。ここは表示だけ */
+  touch-action: none;
+}
+
+/* サムネイルの帯。中央の枠に来た 1 枚が選択対象。left:50% と半分ぶんの戻しで、
+   transform:translateX(0) のとき先頭の 1 枚がちょうど中央に来る。 */
+.vc-track {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  gap: 6px; /* .vc-chip の幅 34 と合わせて VARIANT_PITCH_PX = 40 */
+  margin: -13px 0 0 -17px;
+}
+
+.vc-chip {
+  flex: none;
+  width: 34px;
+  height: 26px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background-color: #2a2b31;
+  /* 透明部分は市松模様（レイヤーサムネイルと同じ扱い）。 */
+  background-image:
+    linear-gradient(45deg, #3a3b42 25%, transparent 25%, transparent 75%, #3a3b42 75%),
+    linear-gradient(45deg, #3a3b42 25%, transparent 25%, transparent 75%, #3a3b42 75%);
+  background-size: 8px 8px;
+  background-position:
+    0 0,
+    4px 4px;
+  overflow: hidden;
+  opacity: 0.6; /* 枠の外（選ばれていない）差分は沈める。中身は見える程度に残す */
+}
+
+.vc-chip img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.vc-chip.on {
+  opacity: 1;
+}
+
+/* 中央の固定枠。ここに来ている 1 枚がキャンバスにも出ていて、離すとそれで確定する。 */
+.vc-frame {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 38px;
+  height: 30px;
+  margin: -15px 0 0 -19px;
+  border: 1.5px solid #7ec7a8;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+/* いま枠に入っている差分の名前と位置。枠と重ならないよう行の右端へ。 */
+.vc-label {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: #a8dcc4;
+  background: rgba(24, 26, 30, 0.9);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+/* ---- レイヤー操作ボタン（Layers パネル上部） ------------------------------
+   アイコン + 4文字ラベルを同じ幅のマスに並べる。文字だけのボタンを一列に流すと、
+   数が増えたときに目的のものを探せなくなるため、グリッドで位置を固定する。 */
+.layer-ops {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.layer-op {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  font-size: 10.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.layer-op .tool-icon {
+  flex: none;
+}
+
+/* 押せない操作（下地が無い・統合先が無い等）は、消さずに薄く残す。
+   「いまは効かない」ことと「そもそも無い」ことを取り違えないため。 */
+.layer-op:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.layer-op:disabled:hover {
+  border-color: var(--border);
+}
+
+/* クリッピングが効いている間は押しっぱなしに見せる（行の ⤵ ボタンと同じ色）。 */
+.layer-op.on {
+  color: rgb(214, 138, 138);
+  background: rgba(198, 116, 116, 0.16);
+  border-color: rgba(198, 116, 116, 0.6);
 }
 
 /* アクティブレイヤー用の単一不透明度スライダー（Layers リスト上部に固定） */

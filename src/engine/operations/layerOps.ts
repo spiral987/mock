@@ -3,6 +3,7 @@ import type { OpHandler } from '../operation';
 import {
   getLayer,
   getNode,
+  getParentInfo,
   replaceLayer,
   updateNode,
   removeNode,
@@ -10,6 +11,8 @@ import {
 } from '../editorState';
 import {
   isGroup,
+  isVariantStack,
+  activeVariant,
   createGroup,
   collectLeafIds,
   collectNodeIds,
@@ -234,6 +237,50 @@ export interface MoveNodeParams {
   index: number;
 }
 
+/**
+ * 出し入れのあった差分スタックを整え直す（＝横軸の「分解」の後始末）。
+ *   - 差分が 1 枚（0 枚）になったら横軸を解いて素のノードへ戻す
+ *     （並べる相手が居ないなら横軸の意味が無い。removeVariant と同じ規則）
+ *   - そうでなければ wantShownId の差分を出す。番号ではなく id で指すので、
+ *     前後に差分が増減しても「さっき見ていたもの」がそのまま出たままになる。
+ *   - wantShownId が残っていない（＝出ていた差分そのものを外へ出した）ときは
+ *     fallbackIndex（抜けた位置）へ寄せる。
+ */
+function settleVariantStack(
+  nodes: LayerNode[],
+  stackId: string,
+  wantShownId: string | null,
+  fallbackIndex: number,
+): LayerNode[] {
+  return nodes.reduce<LayerNode[]>((out, n) => {
+    if (!isGroup(n)) {
+      out.push(n);
+      return out;
+    }
+    if (n.id !== stackId) {
+      out.push({
+        ...n,
+        children: settleVariantStack(n.children, stackId, wantShownId, fallbackIndex),
+      });
+      return out;
+    }
+    if (!isVariantStack(n)) {
+      out.push(n);
+      return out;
+    }
+    if (n.children.length === 0) return out; // 空になったスロットは消える
+    if (n.children.length === 1) {
+      out.push(n.children[0]); // 横軸を解いて素のノードへ戻す
+      return out;
+    }
+    const at = wantShownId ? n.children.findIndex((c) => c.id === wantShownId) : -1;
+    const next =
+      at >= 0 ? at : Math.max(0, Math.min(n.children.length - 1, Math.trunc(fallbackIndex)));
+    out.push({ ...n, variantIndex: next });
+    return out;
+  }, []);
+}
+
 export const moveNodeHandler: OpHandler = {
   type: 'moveNode',
   klass: 'edit',
@@ -246,9 +293,41 @@ export const moveNodeHandler: OpHandler = {
       if (!target || !isGroup(target)) return state; // 親はグループのみ
       if (collectNodeIds(node).includes(parentId)) return state; // 自分の子孫へは不可（循環防止）
     }
+    // 差分スタックの出し入れに備えて、動かす前の「どこから／どこへ／何が出ていたか」を控える。
+    const from = getParentInfo(state, nodeId);
+    const fromParent = from?.parentId ? getNode(state, from.parentId) : undefined;
+    const fromStack = fromParent && isVariantStack(fromParent) ? fromParent : null;
+    const shownFromId = fromStack ? (activeVariant(fromStack)?.id ?? null) : null;
+    const toParent = parentId ? getNode(state, parentId) : undefined;
+    const toStack = toParent && isVariantStack(toParent) ? toParent : null;
+    const shownToId = toStack ? (activeVariant(toStack)?.id ?? null) : null;
+
     const { tree, removed } = removeNode(state.layers, nodeId);
     if (!removed) return state;
-    return { ...state, layers: insertNode(tree, parentId, index, removed) };
+    // 不変条件: 横軸の中に横軸は置かない。スロットをスロットへ入れたら、入れ子にせず
+    // 中身を平らに混ぜる（どちらも「互いに排他な案の集合」なので合わせて 1 つの集合になる。
+    // 入れ子は合成結果が平らな並びと完全に一致し、表現力を増やさずに読みにくさだけ増やす）。
+    const incoming = toStack && isVariantStack(removed) ? removed.children : [removed];
+    let layers = tree;
+    for (let k = 0; k < incoming.length; k++) {
+      // index+k で前から順に差し込む（末尾指定でも並び順が保たれる）。
+      layers = insertNode(layers, parentId, index + k, incoming[k]);
+    }
+
+    if (fromStack && toStack && fromStack.id === toStack.id) {
+      // 同じスロットの中での並べ替え。掴んで動かした差分をそのまま出しておく
+      // （D&D で差分を作るときと同じ「触ったものが出る」挙動に揃える）。
+      layers = settleVariantStack(layers, fromStack.id, nodeId, from!.index);
+    } else {
+      if (fromStack) {
+        // 出ていた差分そのものを外へ出したなら、同じ位置に残った差分を出す。
+        const want = shownFromId === nodeId ? null : shownFromId;
+        layers = settleVariantStack(layers, fromStack.id, want, from!.index);
+      }
+      // 差し込み先がスロットなら、出ている差分が黙って入れ替わらないよう id で指し直す。
+      if (toStack) layers = settleVariantStack(layers, toStack.id, shownToId, 0);
+    }
+    return { ...state, layers };
   },
 };
 

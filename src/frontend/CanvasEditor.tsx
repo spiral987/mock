@@ -12,6 +12,7 @@ import type {
   LayerGroup,
   LayerNode,
   Operation,
+  SelectionMask,
   StrokePoint,
 } from '../types';
 import type { EditorSession } from '../session';
@@ -41,14 +42,54 @@ import {
   fillRegion,
   createTransformOp,
   createSetCanvasSizeOp,
+  createAddVariantOp,
+  createSetVariantIndexOp,
+  createRemoveVariantOp,
+  createMoveAsVariantOp,
+  createLassoFillOp,
+  createSetSelectionOp,
+  createClearSelectionOp,
   type TransformParams,
 } from '../engine/operations';
+import {
+  selectionArea,
+  selectionBounds,
+  traceSelectionOutline,
+  maskStamp,
+  type SelectionMode,
+} from '../engine/selection';
 import { genId } from '../util/id';
-import { layerContentBBox, isGroup, collectLeafIds, collectNodeIds } from '../engine/layer';
-import { getLayer, getNode, updateNode, getParentInfo } from '../engine/editorState';
+import {
+  layerContentBBox,
+  isGroup,
+  collectLeafIds,
+  collectNodeIds,
+  isVariantStack,
+  activeVariant,
+  variantIndexOf,
+} from '../engine/layer';
+import {
+  getLayer,
+  getNode,
+  updateNode,
+  getParentInfo,
+  getSlotInfo,
+  getVariantStackOf,
+} from '../engine/editorState';
 import { flattenState, compositeLayer } from '../engine/composite';
 import { rasterizeSegment, stampDab, type StampFn } from '../engine/strokeRaster';
-import { blendPixel, erasePixel } from '../engine/imageBuffer';
+import {
+  resolveProfile,
+  createBrushStamp,
+  createEraseStamp,
+  sameSettings,
+  BRUSH_DEFAULTS,
+  BRUSH_SETTING_FIELDS,
+  PAPER_SEED,
+  type BrushProfile,
+  type BrushSettings,
+  type BrushType,
+} from '../engine/brushProfile';
 import { clampBBox, padBBox, strokesBBox, unionBBox } from '../engine/geom';
 import { compositeToCanvas, compositeRegionToCanvas } from './render';
 import { bufferToDataURL } from './thumbnail';
@@ -57,28 +98,108 @@ import { describeOp } from './opLabel';
 import { ColorPicker } from './ColorPicker';
 import { ConfirmButton } from './ConfirmButton';
 import { FloatWindow, Section } from './Float';
+import { ToolIcon, type ToolIconName } from './ToolIcon';
+import { drawMarchingAnts, antsDash, ANTS_STEPS } from './marchingAnts';
 
 type Tool =
   | 'brush'
+  | 'gpen'
+  | 'pencil'
+  | 'airbrush'
   | 'eraser'
   | 'bucket'
+  | 'lassoFill'
   | 'eyedropper'
   | 'line'
   | 'rect'
+  | 'lassoSelect'
   | 'transform'
   | 'inspect';
 
-const TOOLS: { id: Tool; label: string; key: string }[] = [
-  { id: 'brush', label: 'Brush', key: 'B' },
-  { id: 'eraser', label: 'Eraser', key: 'E' },
-  { id: 'bucket', label: 'Fill', key: 'G' },
-  { id: 'eyedropper', label: 'Pick', key: 'I' },
-  { id: 'line', label: 'Line', key: 'L' },
-  { id: 'rect', label: 'Rect', key: 'R' },
-  { id: 'transform', label: 'Transform', key: 'V' },
-  // 旧「Select」。矩形で領域を指定して履歴（操作）を特定・ハイライトする = マスクではない。
-  { id: 'inspect', label: 'Inspect', key: 'Q' },
+interface ToolDef {
+  id: Tool;
+  label: string;
+  key: string;
+  icon: ToolIconName;
+  /** ツールチップ2行目（何をする道具か）。 */
+  hint: string;
+}
+
+/**
+ * ツールの一覧。役割ごとにグループへ分け、パレットは「アイコンのグリッド + 見出し」で出す。
+ * 名前とショートカットはツールチップに入れる（ボタンに文字を並べると縦に伸びて探しにくいため）。
+ */
+const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
+  {
+    label: '描く',
+    tools: [
+      { id: 'brush', label: 'ブラシ', key: 'B', icon: 'brush', hint: '素直な丸筆' },
+      { id: 'gpen', label: 'Gペン', key: 'N', icon: 'gpen', hint: '入り抜きの効く硬いペン' },
+      { id: 'pencil', label: '鉛筆', key: 'P', icon: 'pencil', hint: '紙目の残る鉛筆' },
+      { id: 'airbrush', label: 'エアブラシ', key: 'A', icon: 'airbrush', hint: '重ねて濃くする霧' },
+    ],
+  },
+  {
+    label: '消す・塗る',
+    tools: [
+      { id: 'eraser', label: '消しゴム', key: 'E', icon: 'eraser', hint: 'アクティブレイヤーを消す' },
+      { id: 'bucket', label: '塗りつぶし', key: 'G', icon: 'bucket', hint: '同じ色の連結領域を塗る' },
+      {
+        id: 'lassoFill',
+        label: '投げ縄塗り',
+        key: 'U',
+        icon: 'lassoFill',
+        hint: '囲った内側をそのまま塗る（線が閉じていなくてよい）',
+      },
+      { id: 'eyedropper', label: 'スポイト', key: 'I', icon: 'eyedropper', hint: '画面の色を拾う' },
+    ],
+  },
+  {
+    label: '図形',
+    tools: [
+      { id: 'line', label: '直線', key: 'L', icon: 'line', hint: 'ドラッグで直線' },
+      { id: 'rect', label: '矩形', key: 'R', icon: 'rect', hint: 'ドラッグで長方形の外周' },
+    ],
+  },
+  {
+    label: '選択・変形',
+    tools: [
+      {
+        id: 'lassoSelect',
+        label: '投げ縄選択',
+        key: 'M',
+        icon: 'lassoSelect',
+        hint: '囲った内側だけ描けるようにする（Shift=追加 / Alt=削除 / Shift+Alt=交差）',
+      },
+      { id: 'transform', label: '変形', key: 'V', icon: 'transform', hint: '移動・拡大縮小・回転' },
+      {
+        id: 'inspect',
+        label: '履歴しらべ',
+        key: 'Q',
+        icon: 'inspect',
+        hint: '矩形で囲った範囲に関わる操作を履歴からハイライト（選択範囲ではない）',
+      },
+    ],
+  },
 ];
+
+const TOOLS: ToolDef[] = TOOL_GROUPS.flatMap((g) => g.tools);
+
+/** 投げ縄の点列を間引くしきい値(px)。これ未満しか動いていない点は捨てる（多角形の辺を減らす）。 */
+const LASSO_MIN_STEP = 1.5;
+
+
+/**
+ * 描画色の枠。'transparent' は色ではなく「アルファを削る」指定で、
+ * どの筆で描いてもその筆の質感のまま消しゴムとして働く。
+ */
+type ColorSlot = 'main' | 'sub' | 'transparent';
+
+/**
+ * レイヤー行への落とし方。above/below は縦（z順）の並べ替え、into はフォルダの中へ。
+ * left/right は「横に並べる」＝そのスロットの差分（variant）にする。
+ */
+type DropPos = 'above' | 'below' | 'into' | 'left' | 'right';
 
 // S 押下中にキャンバスを上下ドラッグして太さ調整するときの感度（ドラッグpx → 太さ変化量）。
 // MergeView と同じ操作感に揃える。
@@ -88,8 +209,31 @@ const SIZE_DRAG_FACTOR = 0.5;
 const LAYER_THUMB_W = 34;
 const LAYER_THUMB_H = 26;
 
-// レイヤー行のドラッグ開始しきい値(px)。これ未満の移動はクリック（選択/リネーム/ボタン）として扱う。
-const LAYER_DRAG_THRESHOLD = 4;
+// レイヤー行のジェスチャ開始しきい値(px)。これ未満の移動はクリック（選択/リネーム/ボタン）として扱う。
+const LAYER_GESTURE_THRESHOLD = 4;
+
+// 行を「持ち上げる」までの長押し時間(ms)。
+//
+// 移動（並べ替え・フォルダ出し入れ・横へずらして差分化）と、差分の左右スライドは、どちらも
+// 同じ行を掴む操作なので、向きで分けると斜めのドラッグが常に曖昧になる。そこで【時間】で分ける:
+//   押してすぐ動かす → スライド（差分の切り替え）
+//   押したまま待つ  → 持ち上がる → 以後は移動
+// 持ち上げは構造を変える操作なので、少し溜めがある方が誤操作も減る。
+// ⠿ グリップから掴んだときは待たずに持ち上がる（マウスで素早く並べ替えたいとき用）。
+const LAYER_LIFT_MS = 330;
+
+// レイヤーを「横へ持っていく」と判定する横移動量(px)。掴んだ位置からこれ以上ずらして他の行へ
+// 落とすと、縦に積むのではなく横に並ぶ差分になる（＝そのスロットの variant になる）。
+//
+// 落とし先の行の中の絶対位置（左端/右端の帯）で判定しないのは、掴む場所（⠿ グリップ）が行の
+// 左端にあるため。そこを掴んで縦にドラッグすると、通り過ぎる行すべてで「左」判定に入ってしまう。
+// 「横へずらす」という手の動きそのものを見れば、どこを掴んでも意図どおりに分かれる。
+const VARIANT_DROP_DX = 40;
+
+// カルーセルのサムネイル 1 枚ぶんの間隔(px)。＝スライドで 1 段ずらすのに必要な距離でもある
+// （指の移動量とサムネイルの移動量が 1:1 になるので、どこまで動かせば隣かが目で分かる）。
+// CSS の .vc-chip の幅 + gap と一致させること。
+const VARIANT_PITCH_PX = 40;
 
 // キャンバス1辺の上限（画素）。ブラウザの canvas 制限（Chrome ~16384/辺）に合わせた安全上限。
 // 実際には総面積・メモリ（1レイヤ = w*h*4 byte）が先に効くので、大きい値は自己責任で。
@@ -177,6 +321,42 @@ function nearIdentity(m: TransformParams): boolean {
   );
 }
 
+/**
+ * レイヤー操作ボタン（アイコン + 4文字ラベル）。
+ *
+ * レイヤーパネルの上に並ぶ「構造をいじる操作」は数が多く、文字だけのボタンを一列に流すと
+ * どれがどれだか探せなくなる。アイコンで形を、ラベルで意味を、title で効き方を出す3段構えにして、
+ * 同じ見た目のボタンをグリッドに揃える。
+ */
+function LayerOpButton({
+  icon,
+  label,
+  title,
+  onClick,
+  disabled,
+  on,
+}: {
+  icon: ToolIconName;
+  label: string;
+  title: string;
+  onClick: () => void;
+  disabled?: boolean;
+  /** 押しっぱなしに見せる（クリッピングが効いている間など）。 */
+  on?: boolean;
+}) {
+  return (
+    <button
+      className={`layer-op${on ? ' on' : ''}`}
+      title={title}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <ToolIcon name={icon} size={16} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function hexToRgb(hex: string): [number, number, number] {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
   if (!m) return [0, 0, 0];
@@ -241,6 +421,17 @@ export function CanvasEditor({
   const xformBaseStateRef = useRef<EditorState | null>(null);
   const selectRef = useRef<{ startX: number; startY: number } | null>(null);
   const shapeRef = useRef<{ startX: number; startY: number } | null>(null);
+  // 投げ縄（選択 / 塗り）のドラッグ中。点列はキャンバス座標の平坦配列 [x0,y0,x1,y1,...]。
+  // 離した時点で 1 op（setSelection / lassoFill）として確定する = Undo 1 回で元に戻る。
+  const lassoRef = useRef<{ pts: number[]; kind: 'select' | 'fill'; mode: SelectionMode } | null>(
+    null,
+  );
+  // 選択範囲・投げ縄ドラッグを描く重ね canvas（絵の canvas を汚さないので、点線を動かしても再合成が要らない）。
+  const selCanvasRef = useRef<HTMLCanvasElement>(null);
+  // マーチングアンツ（動く点線）の位相。
+  const antsPhaseRef = useRef(0);
+  // 選択マスク → 輪郭ループのキャッシュ（マスクの参照が変わったときだけ再計算する）。
+  const outlineCacheRef = useRef<{ sel: SelectionMask | null; loops: number[][] } | null>(null);
   // S キー押下中の「太さ調整モード」での上下ドラッグ（押下時の clientY と太さを控える）。
   const sizeDragRef = useRef<{ startY: number; startSize: number } | null>(null);
   // Z キー押下中の「ズームモード」での上下ドラッグ（押下時の clientY・倍率・カーソル位置を控える）。
@@ -249,11 +440,31 @@ export function CanvasEditor({
   );
   // レイヤーパネルの D&D 並べ替えでドラッグ中のノード id。
   const dragIdRef = useRef<string | null>(null);
+  // ドラッグを掴んだ位置（クライアント座標）。ここからの横移動量で「縦に積む／横に並べる」を分ける。
+  const dragOriginRef = useRef<{ x: number; y: number } | null>(null);
   // 行のどこを掴んでもドラッグできるよう、pointerdown 時点では「保留」にしておき、しきい値を
   // 超えて動いたら本ドラッグを開始する（それ未満はクリック＝選択/リネーム/ボタン操作として扱う）。
-  const pendingDragRef = useRef<{ id: string; startX: number; startY: number; pointerId: number } | null>(
-    null,
-  );
+  const pendingDragRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    pointerId: number;
+    /** 長押しの計測対象の行要素（タイマー発火時に pointer を捕捉するため控える）。 */
+    el: HTMLElement;
+  } | null>(null);
+  // 長押しで持ち上がるまでのタイマー。動き出す／離す／スライドに入ると取り消す。
+  const liftTimerRef = useRef<number | null>(null);
+  // 差分の左右スライド中（持ち上げる前に横へ動かしたとき）。
+  const swipeRef = useRef<{
+    stackId: string;
+    pointerId: number;
+    startX: number;
+    baseIndex: number;
+    count: number;
+    index: number;
+    /** 端でクランプ済みの横移動量。カルーセルの位置はこれだけで決まる。 */
+    dx: number;
+  } | null>(null);
   // ドラッグ中に pointer へ追従する半透明ゴースト要素。
   const ghostRef = useRef<HTMLDivElement>(null);
   // レイヤー行サムネイルのキャッシュ（node.id → 署名+dataURL）。内容が変わった行だけ再生成する。
@@ -266,13 +477,60 @@ export function CanvasEditor({
   const [sizeAdjust, setSizeAdjust] = useState(false); // S キー押下中 = 太さ調整モード
   const [zoomKey, setZoomKey] = useState(false); // Z キー押下中 = ズームモード
   const [spaceHeld, setSpaceHeld] = useState(false); // Space 長押し = 視点移動（パン）モード
-  const [color, setColor] = useState('#e23b3b');
+
+  // ---- 描画色: メイン / サブ / 透明 の3枠（クリスタと同じ持ち方） --------------
+  // 「透明」は色ではなく "アルファを削る" 指定。選ぶと、いま持っている筆がその質感のまま
+  // 消しゴムになる（Gペンなら Gペンの入り抜きで、鉛筆なら紙目を残したまま消える）。
+  const [mainColor, setMainColor] = useState('#e23b3b');
+  const [subColor, setSubColor] = useState('#ffffff');
+  const [colorSlot, setColorSlot] = useState<ColorSlot>('main');
+  // 透明から色へ戻るときの行き先（直前に使っていた色枠）。
+  const inkSlotRef = useRef<'main' | 'sub'>('main');
+  if (colorSlot !== 'transparent') inkSlotRef.current = colorSlot;
+  /** いま描く色。透明を選んでいる間も「戻る先の色」を指す（カーソル表示やピッカーの対象）。 */
+  const color = (colorSlot === 'sub' || (colorSlot === 'transparent' && inkSlotRef.current === 'sub'))
+    ? subColor
+    : mainColor;
+  const transparentInk = colorSlot === 'transparent';
+  /** この一筆はアルファを削るか（消しゴムツール、または透明色を選んでいるとき）。 */
+  const erasing = transparentInk || tool === 'eraser';
+
+  /** 色を差し替える（スポイト・カラーピッカー・パレット共通）。透明を選んでいたら色枠へ戻す。 */
+  const setColor = (hex: string) => {
+    const slot = colorSlot === 'transparent' ? inkSlotRef.current : colorSlot;
+    if (slot === 'sub') setSubColor(hex);
+    else setMainColor(hex);
+    if (colorSlot === 'transparent') setColorSlot(slot); // 拾った色ですぐ描けるようにする
+  };
+
+  /** X: メイン ⇄ サブ（透明を選んでいるときは直前の色枠へ戻る）。 */
+  const toggleMainSub = () =>
+    setColorSlot((s) => (s === 'transparent' ? inkSlotRef.current : s === 'main' ? 'sub' : 'main'));
+  /** C: 透明 ⇄ 直前の色枠。 */
+  const toggleTransparent = () =>
+    setColorSlot((s) => (s === 'transparent' ? inkSlotRef.current : 'transparent'));
+
   // size はツールごとに保持する（Brush と Eraser で別々の太さを記憶）。
-  const [sizes, setSizes] = useState<Record<string, number>>({ brush: 6, eraser: 16, line: 4, rect: 4 });
+  const [sizes, setSizes] = useState<Record<string, number>>({
+    brush: 6,
+    gpen: 7,
+    pencil: 4,
+    airbrush: 34, // エアブラシは広く薄く乗せる道具なので既定を大きめに
+    eraser: 16,
+    line: 4,
+    rect: 4,
+  });
   const [opacity, setOpacity] = useState(1);
   const [tolerance, setTolerance] = useState(24);
   const [activeLayerId, setActiveLayerId] = useState(session.state.activeLayerId);
-  // 複数選択（Ctrl/⌘+クリックで追加）。選択レイヤー群を一発で Variants 軸にするのに使う。
+  // 差分を「覗き見」している状態。state は変えず、いまどの差分が出るかだけを差し替える
+  // （離す/クリックで初めて 1 op として確定＝見比べても履歴が汚れない）。
+  const [variantPeek, setVariantPeek] = useState<{ stackId: string; index: number } | null>(null);
+  const variantPeekRef = useRef<{ stackId: string; index: number; baseIndex: number } | null>(null);
+  // 左右スライド中のスロット（カルーセルを出す対象）。
+  const [swipingStackId, setSwipingStackId] = useState<string | null>(null);
+  // カルーセルの帯。指の動きに毎フレーム追従させるので、再レンダーを挟まず transform を直接書く。
+  const carouselTrackRef = useRef<HTMLDivElement>(null);
   const [histIndex, setHistIndex] = useState<number | null>(null);
   const [verify, setVerify] = useState<{ ok: boolean; msg: string } | null>(null);
   const [hovering, setHovering] = useState(false);
@@ -283,12 +541,10 @@ export function CanvasEditor({
   const [opacityDraft, setOpacityDraft] = useState<{ id: string; v: number } | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
-  // レイヤー D&D 中のドロップ位置ヒント（対象ノード id と、その上/下/中への挿入）。
-  const [dropHint, setDropHint] = useState<{ id: string; pos: 'above' | 'below' | 'into' } | null>(
-    null,
-  );
-  // ドラッグ中ゴーストに表示するレイヤー名（null = 非ドラッグ）。
-  const [dragGhost, setDragGhost] = useState<{ name: string } | null>(null);
+  // レイヤー D&D 中のドロップ位置ヒント（対象ノード id と、その上/下/中/左/右への挿入）。
+  const [dropHint, setDropHint] = useState<{ id: string; pos: DropPos } | null>(null);
+  // 持ち上げ中の行（null = 掴んでいない）。ゴーストの表示と、持ち上がった行の見た目に使う。
+  const [dragGhost, setDragGhost] = useState<{ id: string; name: string } | null>(null);
   // キャンバスサイズ入力の下書き（Apply で確定）。remount 時に現在サイズで初期化される。
   const [wDraft, setWDraft] = useState(String(width));
   const [hDraft, setHDraft] = useState(String(height));
@@ -296,7 +552,38 @@ export function CanvasEditor({
   const opacityPreviewRef = useRef<{ layerId: string; opacity: number } | null>(null);
 
   const previewing = histIndex !== null;
-  const showCursor = tool === 'brush' || tool === 'eraser' || tool === 'line' || tool === 'rect';
+  // 筆で描くツール（= brush op を出す）。line/rect も同じ経路だが形状ツールとして別扱い。
+  const PAINT_TOOLS: Tool[] = ['brush', 'gpen', 'pencil', 'airbrush'];
+  const isPaintTool = (t: Tool) => PAINT_TOOLS.includes(t);
+  /** ツール → 筆の質感。line/rect など質感を持たないものは 'pen'。 */
+  const brushTypeOf = (t: Tool): BrushType =>
+    t === 'gpen' ? 'gpen' : t === 'pencil' ? 'pencil' : t === 'airbrush' ? 'airbrush' : 'pen';
+  const brushType = brushTypeOf(tool);
+  /** いま選んでいるツールの表示名（パネルの見出し・ラベルはこれを使う）。 */
+  const toolLabel = TOOLS.find((t) => t.id === tool)?.label ?? tool;
+  const showCursor = isPaintTool(tool) || tool === 'eraser' || tool === 'line' || tool === 'rect';
+  // 筆ごとの質感パラメータ（ツールプロパティで編集する）。値は op に焼き込まれるので、
+  // 後からここを変えても過去の op は当時の質感のまま replay される。
+  const [brushTuning, setBrushTuning] = useState<Record<BrushType, BrushSettings>>(() => ({
+    pen: { ...BRUSH_DEFAULTS.pen },
+    gpen: { ...BRUSH_DEFAULTS.gpen },
+    pencil: { ...BRUSH_DEFAULTS.pencil },
+    airbrush: { ...BRUSH_DEFAULTS.airbrush },
+  }));
+  const brushSet = brushTuning[brushType];
+  /**
+   * 消す op に焼き込む質感。消しゴムツールは従来どおり素の硬い円（＝省略＝pen プリセット）、
+   * 「透明色」で筆を使ったときだけ、その筆の質感をそのまま持ち込む。
+   */
+  const eraserTexture = (): { brushType?: BrushType; brush?: BrushSettings } =>
+    tool === 'eraser' ? {} : { brushType, brush: brushSet };
+  const setBrushField = (key: keyof BrushSettings, v: number) =>
+    setBrushTuning((prev) => ({ ...prev, [brushType]: { ...prev[brushType], [key]: v } }));
+  const resetBrushTuning = () =>
+    setBrushTuning((prev) => ({ ...prev, [brushType]: { ...BRUSH_DEFAULTS[brushType] } }));
+  // スポイトから戻る先。直前に使っていた筆を覚えておく（既定はブラシ）。
+  const lastPaintToolRef = useRef<Tool>('brush');
+  if (isPaintTool(tool)) lastPaintToolRef.current = tool;
 
   // 現在ツールの size（size を使うツールのみ。それ以外はフォールバック値）。
   const size = sizes[tool] ?? 8;
@@ -333,6 +620,12 @@ export function CanvasEditor({
     let st = session.state;
     const pv = opacityPreviewRef.current;
     if (pv) st = updateNode(st, pv.layerId, (n) => ({ ...n, opacity: pv.opacity }));
+    // 差分サムネイルを覗き見中は、まだ確定していない差分を仮に出して見せる
+    // （クリックで初めて 1 op として確定する）。
+    const vp = variantPeekRef.current;
+    if (vp && vp.index !== vp.baseIndex) {
+      st = updateNode(st, vp.stackId, (n) => (isGroup(n) ? { ...n, variantIndex: vp.index } : n));
+    }
     return st;
   };
 
@@ -346,6 +639,15 @@ export function CanvasEditor({
     return bb.w > 0 && bb.h > 0 ? bb : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tool, version, activeLayerId]);
+
+  // 選択範囲の要約（パネル表示用）。面積の算出はマスク全走査なので、version ではなく
+  // 「マスクの参照」を依存にする（描くたびに数百万画素を数え直さないため。選択を変えた時だけ走る）。
+  const selectionMask = session.state.selection ?? null;
+  const selectionInfo = useMemo<{ w: number; h: number; area: number } | null>(() => {
+    if (!selectionMask) return null;
+    const b = selectionBounds(selectionMask);
+    return { w: b.w, h: b.h, area: selectionArea(selectionMask) };
+  }, [selectionMask]);
 
   // Transform ツールの枠＋頂点ハンドル描画（quad は canvas 座標の4頂点）。
   // 線幅・ハンドルはスクリーンpx 基準（zoom で割って CSS 拡大後に一定サイズに見せる）。
@@ -440,6 +742,7 @@ export function CanvasEditor({
   useEffect(() => () => {
     if (exactTimerRef.current !== null) clearTimeout(exactTimerRef.current);
     if (wheelPanTimerRef.current !== null) clearTimeout(wheelPanTimerRef.current);
+    if (liftTimerRef.current !== null) clearTimeout(liftTimerRef.current);
   }, []);
 
   // 新しいドキュメント（別 session）になったときだけ Replayer を作り直す。session.width/height は
@@ -528,16 +831,32 @@ export function CanvasEditor({
       doRedo();
       return;
     }
+    // Ctrl/⌘+D = 選択解除（他のアプリと同じ割り当て。ブラウザのブックマーク追加は抑止する）。
+    if (meta && (e.key === 'd' || e.key === 'D')) {
+      e.preventDefault();
+      clearSelection();
+      return;
+    }
     if (meta) return; // 他の Ctrl/Cmd 系はブラウザに委ねる
     switch (e.key) {
       case 'b': case 'B': setTool('brush'); break;
+      case 'n': case 'N': setTool('gpen'); break;
+      case 'p': case 'P': setTool('pencil'); break;
+      case 'a': case 'A': setTool('airbrush'); break;
       case 'e': case 'E': setTool('eraser'); break;
       case 'g': case 'G': setTool('bucket'); break;
+      case 'u': case 'U': setTool('lassoFill'); break;
       case 'i': case 'I': setTool('eyedropper'); break;
       case 'l': case 'L': setTool('line'); break;
       case 'r': case 'R': setTool('rect'); break;
+      case 'm': case 'M': setTool('lassoSelect'); break;
       case 'v': case 'V': setTool('transform'); break;
       case 'q': case 'Q': setTool('inspect'); break;
+      case 'x': case 'X': toggleMainSub(); break;
+      case 'c': case 'C': toggleTransparent(); break;
+      // いま描いているレイヤーが属するスロットの差分を往復する（A/B をパタパタ見比べる）。
+      case ',': stepActiveVariant(-1); break;
+      case '.': stepActiveVariant(1); break;
       case '[': setSize((s) => Math.max(1, s - 2)); break;
       case ']': setSize((s) => Math.min(80, s + 2)); break;
     }
@@ -782,19 +1101,24 @@ export function CanvasEditor({
       drawHighlight(c);
       return;
     }
-    const op =
-      tool === 'eraser'
-        ? createEraserOp(activeLayerId, strokes, { size, opacity }, width, height)
-        : createBrushOp(
-            activeLayerId,
-            strokes,
-            { color: hexToRgb(color), size, opacity },
-            width,
-            height,
-          );
-    compositeToCanvas(c, applyOperation(session.state, op));
+    compositeToCanvas(c, applyOperation(session.state, strokeOp(strokes)));
     drawHighlight(c);
   };
+
+  /**
+   * 一筆ぶんの操作を作る。透明色（または消しゴムツール）なら eraser、それ以外は brush。
+   * プレビューと確定で必ず同じ op を作るため、ここ 1 か所に集約する。
+   */
+  const strokeOp = (strokes: StrokePoint[]): Operation =>
+    erasing
+      ? createEraserOp(activeLayerId, strokes, { size, opacity, ...eraserTexture() }, width, height)
+      : createBrushOp(
+          activeLayerId,
+          strokes,
+          { color: hexToRgb(color), size, opacity, brushType, brush: brushSet },
+          width,
+          height,
+        );
 
   const drawSelectionPreview = (x0: number, y0: number, x1: number, y1: number) => {
     const c = canvasRef.current!;
@@ -806,6 +1130,140 @@ export function CanvasEditor({
     ctx.setLineDash([4, 3]);
     ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
     ctx.restore();
+  };
+
+  // ---- 選択範囲オーバーレイ（マーチングアンツ）と投げ縄のプレビュー ----------------
+  // 絵の canvas とは別の重ね canvas に描く。点線を動かしても・投げ縄をドラッグしても
+  // レイヤー合成をやり直さずに済むので、4K でも軽い。
+
+  /** 現在の選択マスクの輪郭ループ（マスク参照が変わったときだけ再計算）。 */
+  const selectionOutline = (): number[][] => {
+    const sel = session.state.selection ?? null;
+    const cached = outlineCacheRef.current;
+    if (cached && cached.sel === sel) return cached.loops;
+    const loops = sel ? traceSelectionOutline(sel) : [];
+    outlineCacheRef.current = { sel, loops };
+    return loops;
+  };
+
+  const drawOverlay = () => {
+    const c = selCanvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, c.width, c.height);
+    const z = zoomRef.current || 1;
+    const dash = antsDash(z);
+
+    // 確定済みの選択範囲＝マーチングアンツ（流れる点線）。描き方は marchingAnts.ts に集約。
+    drawMarchingAnts(ctx, {
+      loops: previewing ? [] : selectionOutline(),
+      zoom: z,
+      phase: antsPhaseRef.current,
+      width,
+      height,
+    });
+
+    // ドラッグ中の投げ縄。塗りのときは確定後の範囲が分かるよう内側を薄く塗って見せる。
+    const la = lassoRef.current;
+    if (la && la.pts.length >= 4) {
+      const p = new Path2D();
+      p.moveTo(la.pts[0], la.pts[1]);
+      for (let i = 2; i < la.pts.length; i += 2) p.lineTo(la.pts[i], la.pts[i + 1]);
+      p.closePath();
+      if (la.kind === 'fill') {
+        // 透明色のときは「色が乗る」わけではないので、白の薄がけで抜ける範囲だけ示す。
+        ctx.fillStyle = transparentInk ? '#ffffff' : color;
+        ctx.globalAlpha = (transparentInk ? 0.22 : 0.35) * opacity;
+        ctx.fill(p);
+        ctx.globalAlpha = 1;
+      }
+      // 拡大時に線が 1 キャンバス画素を割ってぼやけないよう、アンツと同じ下限を掛ける。
+      ctx.lineWidth = Math.max(1, 1.5 / z);
+      ctx.setLineDash([dash, dash * 0.75]);
+      ctx.strokeStyle = la.kind === 'fill' ? (transparentInk ? '#ffffff' : color) : '#56ccf2';
+      ctx.stroke(p);
+      ctx.setLineDash([]);
+    }
+  };
+
+  // 選択の変化・ズーム・履歴閲覧の切り替え・キャンバスサイズ変更でオーバーレイを描き直す
+  // （canvas の width/height を変えると中身が消えるので、サイズ変更後も描き直しが要る）。
+  useEffect(() => {
+    drawOverlay();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectionMask, zoom, previewing, width, height]);
+
+  // 点線を流す。選択が無いとき／履歴閲覧中は止める（無駄な描画をしない）。
+  // 1 ティックで破線 1 本ぶんの 1/ANTS_STEPS だけ進み、2×ANTS_STEPS ティックで元の見た目に戻る。
+  useEffect(() => {
+    if (previewing || !selectionMask) return;
+    const t = window.setInterval(() => {
+      antsPhaseRef.current = (antsPhaseRef.current + 1) % (ANTS_STEPS * 2);
+      drawOverlay();
+    }, 70);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectionMask, previewing]);
+
+  /** 修飾キー → 既存選択との合成方法（Photoshop 等と同じ割り当て）。 */
+  const selectionModeOf = (e: { shiftKey: boolean; altKey: boolean }): SelectionMode =>
+    e.shiftKey && e.altKey ? 'intersect' : e.shiftKey ? 'add' : e.altKey ? 'subtract' : 'replace';
+
+  /** 投げ縄に点を足す（一定距離動いていなければ捨てて多角形の辺数を抑える）。 */
+  const pushLassoPoint = (x: number, y: number) => {
+    const la = lassoRef.current;
+    if (!la) return;
+    const n = la.pts.length;
+    const dx = x - la.pts[n - 2];
+    const dy = y - la.pts[n - 1];
+    if (dx * dx + dy * dy < LASSO_MIN_STEP * LASSO_MIN_STEP) return;
+    la.pts.push(x, y);
+  };
+
+  /** 投げ縄ジェスチャの確定。選択なら setSelection、塗りなら lassoFill を 1 op 積む。 */
+  const commitLasso = () => {
+    const la = lassoRef.current;
+    lassoRef.current = null;
+    if (!la || previewing) {
+      drawOverlay();
+      return;
+    }
+    if (la.pts.length < 6) {
+      drawOverlay(); // 3点未満は面にならない（誤クリック）。プレビューを消すだけ。
+      return;
+    }
+    if (la.kind === 'select') {
+      // 画素は変わらないので再描画は要らない。dirty を空同然にして全面 flatten を避ける
+      // （version 効果は必ず何か描き直すので、最小の矩形を渡してオーバーレイだけ更新させる）。
+      markDirty({ x: 0, y: 0, w: 0, h: 0 });
+      session.apply(createSetSelectionOp(la.pts, la.mode, session.state, width, height));
+    } else {
+      const op = createLassoFillOp(
+        activeLayerId,
+        la.pts,
+        {
+          color: transparentInk ? [0, 0, 0] : hexToRgb(color),
+          opacity,
+          erase: transparentInk, // 透明色の投げ縄塗り = 囲った内側を消す
+        },
+        width,
+        height,
+      );
+      markDirty(op.region);
+      session.apply(op);
+    }
+    onEdit();
+    drawOverlay();
+  };
+
+  /** 選択を解除する（1 op としてログに積むので Undo で戻せる）。 */
+  const clearSelection = () => {
+    if (previewing || !session.state.selection) return;
+    markDirty({ x: 0, y: 0, w: 0, h: 0 });
+    session.apply(createClearSelectionOp(width, height));
+    onEdit();
   };
 
   const getActiveLayer = (): Layer | undefined => getLayer(session.state, activeLayerId);
@@ -825,7 +1283,7 @@ export function CanvasEditor({
     const hex = hexAt(flattenState(session.state), x, y);
     if (!hex) return;
     setColor(hex);
-    setTool('brush'); // 採取後はブラシへ（一般的な挙動）
+    setTool(lastPaintToolRef.current); // 採取後は直前に使っていた筆へ戻る（鉛筆で拾って鉛筆で描ける）
   };
 
   // 右ボタン長押し中の一時スポイト。押下時の合成画像を1枚控え、移動でライブ採取、離した位置で確定する。
@@ -833,13 +1291,25 @@ export function CanvasEditor({
   const rightPickRef = useRef<ImageBuffer | null>(null);
 
   // 塗りつぶし: 影響領域を先に算出して region に渡し、fill 操作を適用する。
+  // 透明色のときは同じ領域のアルファを削る（＝連結領域を透明にする）。
   const doFill = (x: number, y: number) => {
     if (previewing) return;
     const region = fillRegion(session.state, activeLayerId, x, y, tolerance);
     if (region.w <= 0 || region.h <= 0) return; // 種点がレイヤ外 → 何もしない（空opを残さない）
     markDirty(region);
     session.apply(
-      createFillOp(activeLayerId, hexToRgb(color), opacity, x, y, tolerance, region, width, height),
+      createFillOp(
+        activeLayerId,
+        transparentInk ? [0, 0, 0] : hexToRgb(color),
+        opacity,
+        x,
+        y,
+        tolerance,
+        region,
+        width,
+        height,
+        transparentInk,
+      ),
     );
     onEdit();
   };
@@ -1014,6 +1484,7 @@ export function CanvasEditor({
     opacity: number; // アクティブレイヤの不透明度（合成時に globalAlpha で適用）
     radius: number;
     stamp: StampFn; // ブラシ=blend / 消しゴム=erase。strokeOpacity を内包。
+    profile: BrushProfile; // 筆の質感（dab の置き方）。確定時の op と必ず同じものを使う。
     last: StrokePoint | null; // 直前にスタンプした点（次区間の起点）
     primed: boolean; // 一度でも全面合成したか（初回のみ全面、以後は dirty 矩形だけ再合成）。
     dirty: { minX: number; minY: number; maxX: number; maxY: number } | null; // 前回描画以降に変化した矩形。
@@ -1114,12 +1585,21 @@ export function CanvasEditor({
     // 合成時に globalAlpha で掛けるため、ここでは opacity:1 で焼く。
     compositeLayer(activeBuf, { ...node, opacity: 1 });
     actx.putImageData(activeImage, 0, 0);
-    const [r, g, b] = hexToRgb(color);
     const op = opacity;
-    const stamp: StampFn =
-      tool === 'eraser'
-        ? (buf, x, y, cov) => erasePixel(buf, x, y, op * cov)
-        : (buf, x, y, cov) => blendPixel(buf, x, y, r, g, b, op * cov);
+    // プレビューと確定描画で「同じ StampFn・同じプロファイル」を使う（別々に組むとズレる）。
+    const set = tool === 'eraser' ? BRUSH_DEFAULTS.pen : brushSet;
+    // 作業バッファはキャンバス座標そのもの（offset 0,0）なので、選択マスクもその座標で掛ける。
+    // 確定描画（op の apply）と同じ maskStamp を通すので、選択の縁までプレビューと一致する。
+    // 透明色のときは同じ質感のまま消す側（createEraseStamp）へ切り替える。
+    const stamp: StampFn = maskStamp(
+      erasing
+        ? createEraseStamp(op, set, PAPER_SEED)
+        : createBrushStamp(hexToRgb(color), op, set, PAPER_SEED),
+      session.state.selection,
+      0,
+      0,
+    );
+    const profile = resolveProfile(set);
     const { below, above } = getBelowAbove(layers, k);
     brushPreviewRef.current = {
       below,
@@ -1130,6 +1610,7 @@ export function CanvasEditor({
       opacity: node.opacity,
       radius: size / 2,
       stamp,
+      profile,
       last: null,
       primed: false,
       dirty: null,
@@ -1143,10 +1624,10 @@ export function CanvasEditor({
     const pv = brushPreviewRef.current;
     if (!pv) return;
     if (pv.last === null) {
-      stampDab(pv.activeBuf, pt, pv.radius, 0, 0, pv.stamp);
+      stampDab(pv.activeBuf, pt, pv.radius, 0, 0, pv.stamp, pv.profile);
       flushBrushDirty(pv, pt, pt);
     } else {
-      rasterizeSegment(pv.activeBuf, pv.last, pt, pv.radius, 0, 0, pv.stamp);
+      rasterizeSegment(pv.activeBuf, pv.last, pt, pv.radius, 0, 0, pv.stamp, pv.profile);
       flushBrushDirty(pv, pv.last, pt);
     }
     pv.last = pt;
@@ -1231,6 +1712,19 @@ export function CanvasEditor({
     }
   };
 
+  /**
+   * pointer の捕捉。捕捉できなくても処理は続けられるので、例外で呼び出し元を止めない。
+   * setPointerCapture は「その pointerId がもう有効でない」ときに例外を投げる仕様で、
+   * 素で呼ぶと pointerdown ハンドラ全体が中断され、ストロークが黙って消えることがある。
+   */
+  const capturePointer = (el: Element | null | undefined, pointerId: number) => {
+    try {
+      el?.setPointerCapture?.(pointerId);
+    } catch {
+      /* 捕捉できなくても、以後のイベントは要素に届く前提で続行する */
+    }
+  };
+
   // 盤面のどこからでも視点操作（パン/ズーム）を開始できるよう、viewport でも pointerdown を受ける。
   // 生キャンバス上は canvas 側 onPointerDown が処理するのでスキップ（二重発火防止）。ポインタ捕捉は
   // canvas に張り、以後の move/up は既存の canvas ハンドラ（panningRef/zoomDragRef 分岐）がそのまま処理する。
@@ -1239,13 +1733,13 @@ export function CanvasEditor({
     const startPan = () => {
       e.preventDefault();
       panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
-      canvasRef.current?.setPointerCapture?.(e.pointerId);
+      capturePointer(canvasRef.current, e.pointerId);
     };
     if (e.button === 1 || spaceHeld) return startPan();
     if (zoomKey) {
       e.preventDefault();
       zoomDragRef.current = { startY: e.clientY, startZoom: zoomRef.current, anchorX: e.clientX, anchorY: e.clientY };
-      canvasRef.current?.setPointerCapture?.(e.pointerId);
+      capturePointer(canvasRef.current, e.pointerId);
     }
   };
 
@@ -1255,28 +1749,28 @@ export function CanvasEditor({
     if (e.button === 1) {
       e.preventDefault();
       panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
-      canvasRef.current?.setPointerCapture?.(e.pointerId);
+      capturePointer(canvasRef.current, e.pointerId);
       return;
     }
     // Space 長押し（視点移動モード）: ドラッグでパン（描画せず視点だけ動かす）。
     if (spaceHeld) {
       e.preventDefault();
       panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
-      canvasRef.current?.setPointerCapture?.(e.pointerId);
+      capturePointer(canvasRef.current, e.pointerId);
       return;
     }
     // Z 押下中（ズームモード）: 押下位置をカーソル基準に、上下ドラッグで拡大/縮小。
     if (zoomKey) {
       e.preventDefault();
       zoomDragRef.current = { startY: e.clientY, startZoom: zoomRef.current, anchorX: e.clientX, anchorY: e.clientY };
-      canvasRef.current?.setPointerCapture?.(e.pointerId);
+      capturePointer(canvasRef.current, e.pointerId);
       return;
     }
     // 右ボタン長押し = 一時スポイト。押下時の合成画像を控え、移動でライブ採取、離した位置で確定。
     if (e.button === 2) {
       e.preventDefault();
       const c = canvasRef.current!;
-      c.setPointerCapture?.(e.pointerId);
+      capturePointer(c, e.pointerId);
       const flat = flattenState(session.state);
       rightPickRef.current = flat;
       const pt = getPoint(e);
@@ -1287,7 +1781,7 @@ export function CanvasEditor({
     }
     if (previewing) return;
     const c = canvasRef.current!;
-    c.setPointerCapture?.(e.pointerId);
+    capturePointer(c, e.pointerId);
     const pt = getPoint(e);
     // S 押下中（太さ調整モード）: 押下位置にリングを固定し、上下ドラッグで太さを変える。
     // 太さを持つツール（ブラシ/消しゴム/直線/矩形 = showCursor）のときだけ有効。
@@ -1332,6 +1826,13 @@ export function CanvasEditor({
       c.style.cursor = hit.mode === 'rotate' ? 'grabbing' : xformCursor(hit);
     } else if (tool === 'inspect') {
       selectRef.current = { startX: pt.x, startY: pt.y };
+    } else if (tool === 'lassoSelect' || tool === 'lassoFill') {
+      lassoRef.current = {
+        pts: [pt.x, pt.y],
+        kind: tool === 'lassoFill' ? 'fill' : 'select',
+        mode: selectionModeOf(e), // Shift=追加 / Alt=削除 / Shift+Alt=交差（押下時の修飾で決める）
+      };
+      drawOverlay();
     } else if (tool === 'line' || tool === 'rect') {
       shapeRef.current = { startX: pt.x, startY: pt.y };
       const snap = ensureSnapshot();
@@ -1429,6 +1930,10 @@ export function CanvasEditor({
     } else if (selectRef.current) {
       const pt = getPoint(e);
       drawSelectionPreview(selectRef.current.startX, selectRef.current.startY, pt.x, pt.y);
+    } else if (lassoRef.current) {
+      // 中間サンプルも全部拾ってから間引く（速く動かしても輪郭がカクつかない）。
+      for (const pt of getCoalescedPoints(e)) pushLassoPoint(pt.x, pt.y);
+      drawOverlay();
     } else if (shapeRef.current) {
       const pt = getPoint(e);
       renderStrokePreview(shapeStrokes(shapeRef.current.startX, shapeRef.current.startY, pt.x, pt.y));
@@ -1464,16 +1969,7 @@ export function CanvasEditor({
       drawingRef.current = null;
       teardownBrushPreview(); // 増分プレビューのキャッシュ/保留rAFを破棄（以降は決定的 repaint）
       if (strokes.length > 0) {
-        const op =
-          tool === 'eraser'
-            ? createEraserOp(activeLayerId, strokes, { size, opacity }, width, height)
-            : createBrushOp(
-                activeLayerId,
-                strokes,
-                { color: hexToRgb(color), size, opacity },
-                width,
-                height,
-              );
+        const op = strokeOp(strokes);
         session.apply(op);
         // 確定描画はデバウンス。プレビュー最終フレームが表示を担うので、連続ストロークでも 1 本ごとに
         // 固まらない（バーストが収まってから 90ms で 1 回だけ確定描画）。version 依存の useEffect は
@@ -1533,20 +2029,17 @@ export function CanvasEditor({
       };
       if (bbox.w > 2 && bbox.h > 2) onRegionSelect(bbox);
       repaint();
+    } else if (lassoRef.current) {
+      const pt = getPoint(e);
+      pushLassoPoint(pt.x, pt.y);
+      commitLasso();
     } else if (shapeRef.current) {
       const pt = getPoint(e);
       const { startX, startY } = shapeRef.current;
       shapeRef.current = null;
       // 始点と終点が同じなら何もしない（誤クリック対策）。
       if (Math.abs(pt.x - startX) > 1 || Math.abs(pt.y - startY) > 1) {
-        const strokes = shapeStrokes(startX, startY, pt.x, pt.y);
-        const op = createBrushOp(
-          activeLayerId,
-          strokes,
-          { color: hexToRgb(color), size, opacity },
-          width,
-          height,
-        );
+        const op = strokeOp(shapeStrokes(startX, startY, pt.x, pt.y));
         markDirty(op.region);
         session.apply(op);
         onEdit();
@@ -1809,7 +2302,7 @@ export function CanvasEditor({
     if (previewing) return;
     e.preventDefault();
     e.stopPropagation();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    capturePointer(e.currentTarget as HTMLElement, e.pointerId);
     resizeDragRef.current = { axis, startX: e.clientX, startY: e.clientY, startW: width, startH: height, curW: width, curH: height };
     showResizeOutline(width, height);
   };
@@ -1870,9 +2363,10 @@ export function CanvasEditor({
   };
 
   // クリッピング（下のレイヤーにクリップ）。リーフのみ。直下に兄弟（＝下地）があるとき効く。
+  // 横軸（差分スタック）の中に居るときは、合成上そのスロットの位置に居るので、下地はスロットの下。
   const canClip = (n: LayerNode): boolean => {
     if (isGroup(n)) return false;
-    const info = getParentInfo(session.state, n.id);
+    const info = getSlotInfo(session.state, n.id);
     return !!info && info.index > 0;
   };
   const toggleClip = (n: LayerNode) => {
@@ -1891,6 +2385,39 @@ export function CanvasEditor({
     repaint();
   };
 
+  // ---- レイヤーの横軸（差分スタック） ----------------------------------------
+  // 縦軸（z 順）に対して、同じスロットに互いに排他な差分を左右へ並べる。増やす対象は
+  // アクティブレイヤーの居るスロット。既に横軸なら右隣へ、まだなら その場で横軸化して 2 つ目にする。
+  const addVariant = (copy: boolean) => {
+    if (previewing) return;
+    const target = getNode(session.state, activeLayerId);
+    if (!target) return;
+    const stack = getVariantStackOf(session.state, activeLayerId);
+    const count = stack ? stack.children.length : 1;
+    const name = copy ? `${target.name} copy` : `Var ${count + 1}`;
+    markDirty('full');
+    session.apply(
+      createAddVariantOp(target.id, stack?.id ?? genId('variants'), genId('layer'), name, copy),
+    );
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
+  };
+
+  // いま出ている差分を捨てる。残り 1 つになったら横軸は解け、素のレイヤーに戻る。
+  const removeVariant = (stack: LayerGroup, variant: LayerNode) => {
+    if (previewing) return;
+    // 差分が 1 つしか残っていない退化スタックはスロットごと消す。
+    if (stack.children.length < 2) {
+      deleteLayer(stack);
+      return;
+    }
+    if (leafCount() - collectLeafIds(variant).length < 1) return; // 最低1リーフを残す
+    markDirty('full');
+    session.apply(createRemoveVariantOp(stack.id, variant.id, nodeRegion(variant)));
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
+  };
+
   // アクティブレイヤーの内容を全消去（透明化）。1操作として記録され Undo 可能。
   const clearActiveLayer = () => {
     if (previewing) return;
@@ -1902,8 +2429,11 @@ export function CanvasEditor({
   };
 
   // 下のレイヤーと統合（merge down）。同じ親内の隣接リーフ同士のみ。
+  // 横軸（差分スタック）の中の差分は対象外: 横の隣は「別の可能性」であって下ではないし、
+  // スロットの下と統合すると他の差分が行き場を失う。
   const canMergeDown = (n: LayerNode): boolean => {
     if (isGroup(n)) return false;
+    if (getVariantStackOf(session.state, n.id)) return false;
     const info = getParentInfo(session.state, n.id);
     if (!info || info.index <= 0) return false;
     return !isGroup(info.siblings[info.index - 1]);
@@ -1932,37 +2462,207 @@ export function CanvasEditor({
     }
   };
 
+  const cancelLiftTimer = () => {
+    if (liftTimerRef.current !== null) {
+      window.clearTimeout(liftTimerRef.current);
+      liftTimerRef.current = null;
+    }
+  };
+
+  // 行の外で離したときの後始末。持ち上がる前は pointer を捕捉していないので、pointerup が
+  // 行に届かないことがある。放っておくと「離した後に勝手に持ち上がる」ので window で拾って止める。
+  useEffect(() => {
+    const cancel = () => {
+      if (dragIdRef.current) return; // 持ち上がった後は行側の onPointerUp が面倒を見る
+      cancelLiftTimer();
+      pendingDragRef.current = null;
+    };
+    window.addEventListener('pointerup', cancel);
+    window.addEventListener('pointercancel', cancel);
+    return () => {
+      window.removeEventListener('pointerup', cancel);
+      window.removeEventListener('pointercancel', cancel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** 行を持ち上げる（＝移動ジェスチャの開始）。以後の move/up を確実に受けるため pointer を捕捉する。 */
+  const liftRow = () => {
+    cancelLiftTimer();
+    const p = pendingDragRef.current;
+    if (!p) return;
+    const node = getNode(session.state, p.id);
+    if (!node) {
+      pendingDragRef.current = null;
+      return;
+    }
+    dragIdRef.current = p.id;
+    dragOriginRef.current = { x: p.startX, y: p.startY };
+    capturePointer(p.el, p.pointerId);
+    setDragGhost({ id: p.id, name: node.name });
+    pendingDragRef.current = null;
+  };
+
   // 行のどこでも掴めるように、pointerdown ではドラッグを「保留」にするだけ（クリックを壊さない）。
   // ボタン/入力欄の上では保留しない（そのコントロールのクリック/入力を優先）。
+  // 保留のまま LAYER_LIFT_MS 押し続けると持ち上がり、⠿ グリップからならすぐ持ち上がる。
   const onRowPointerDown = (n: LayerNode, e: ReactPointerEvent) => {
     if (previewing) return;
     if (e.button !== 0) return; // 主ボタン（左/ペン接地）のみ
     const el = e.target as HTMLElement | null;
     if (el && el.closest('button, input, textarea, select, [contenteditable="true"]')) return;
-    pendingDragRef.current = { id: n.id, startX: e.clientX, startY: e.clientY, pointerId: e.pointerId };
+    cancelLiftTimer();
+    pendingDragRef.current = {
+      id: n.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      pointerId: e.pointerId,
+      el: e.currentTarget as HTMLElement,
+    };
+    if (el && el.closest('.layer-grip')) {
+      liftRow(); // 掴む取っ手からは待たずに持ち上げる
+      return;
+    }
+    liftTimerRef.current = window.setTimeout(liftRow, LAYER_LIFT_MS);
+  };
+
+  // ---- レイヤーの横軸（差分スタック）の切り替え ----
+  // 行に差分のサムネイルを横に並べ、ホバーで「その差分が出ている絵」を仮に見せ、
+  // クリックで確定する。覗き見の間は state を一切触らず displayState() で差し替えるだけなので、
+  // 見比べても履歴は汚れない（確定して初めて 1 op = Undo 1 回になる）。
+  const peekVariant = (stack: LayerGroup, index: number) => {
+    if (previewing || dragIdRef.current) return; // 並べ替えドラッグ中に覗き見が割り込まないように
+    const base = variantIndexOf(stack);
+    if (index === base) {
+      clearVariantPeek(); // 出ているものへ戻ってきた
+      return;
+    }
+    const cur = variantPeekRef.current;
+    if (cur && cur.stackId === stack.id && cur.index === index) return;
+    variantPeekRef.current = { stackId: stack.id, index, baseIndex: base };
+    setVariantPeek({ stackId: stack.id, index });
+    repaint();
+  };
+
+  /**
+   * カルーセルの帯の位置。baseIndex の 1 枚が中央の枠に来る位置から、指の移動量ぶんずらす。
+   *
+   * 向き: 掴んでいるのは「差分の帯そのもの」で、内容が指について動く（写真カルーセルと同じ）。
+   * 帯を左へ引けば帯は左へ流れ、右隣の差分が中央の枠に入ってくる。
+   * 中央の枠は動かない。動くのは常に中身の方。
+   */
+  const carouselTransform = (sw: { baseIndex: number; dx: number }) =>
+    `translateX(${-sw.baseIndex * VARIANT_PITCH_PX + sw.dx}px)`;
+
+  /**
+   * スライドの現在位置を反映する。カルーセルを指に追従させ、中央の枠に来た 1 枚を覗き見する。
+   * スライドを始めたその move でも呼ぶ（開始と反映を分けると、速く弾いたときに最初の移動量が
+   * 捨てられて 1 段も動かないことがある）。
+   */
+  const updateSwipe = (clientX: number) => {
+    const sw = swipeRef.current;
+    if (!sw) return;
+    // 端を越えて滑らないよう、動かせる範囲を先頭〜末尾に収める。
+    // 帯を右へ引くほど左（前）の差分が枠に来るので、右へ引ける量は左に残っている枚数で決まる。
+    const maxRight = sw.baseIndex * VARIANT_PITCH_PX;
+    const maxLeft = -(sw.count - 1 - sw.baseIndex) * VARIANT_PITCH_PX;
+    sw.dx = Math.max(maxLeft, Math.min(maxRight, clientX - sw.startX));
+    // 毎フレームの追従は再レンダーを挟まず直接書く（再レンダー時も同じ値を描くので食い違わない）。
+    const track = carouselTrackRef.current;
+    if (track) track.style.transform = carouselTransform(sw);
+    // 帯を左へ引く＝帯が左へ流れる＝右隣の差分が枠に入る（内容が指について動く向き）。
+    const next = Math.max(
+      0,
+      Math.min(sw.count - 1, sw.baseIndex - Math.round(sw.dx / VARIANT_PITCH_PX)),
+    );
+    if (next !== sw.index) {
+      sw.index = next;
+      const stack = getNode(session.state, sw.stackId);
+      if (stack && isVariantStack(stack)) peekVariant(stack, next);
+    }
+  };
+
+  /** 覗き見をやめて実体の見た目へ戻す。 */
+  const clearVariantPeek = () => {
+    if (!variantPeekRef.current) return;
+    variantPeekRef.current = null;
+    setVariantPeek(null);
+    repaint();
+  };
+
+  /** サムネイル帯の 1 枚を選んで確定（1 op = Undo 1 回）。 */
+  const chooseVariant = (stack: LayerGroup, index: number) => {
+    variantPeekRef.current = null;
+    setVariantPeek(null);
+    if (previewing || index === variantIndexOf(stack) || index < 0) {
+      repaint(); // 覗き見をやめるだけ
+      return;
+    }
+    markDirty('full'); // 差分の入れ替えは絵の全面が変わりうる
+    session.apply(createSetVariantIndexOp(stack.id, index));
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
+  };
+
+  /** 1 段ずらす（キーボードと一覧クリック用）。 */
+  const stepVariant = (stack: LayerGroup, delta: number) => {
+    const next = variantIndexOf(stack) + delta;
+    if (next < 0 || next >= stack.children.length) return;
+    chooseVariant(stack, next);
+  };
+
+  /** アクティブレイヤーを含む最も内側のスロット（フォルダを跨いでも遡る）。 */
+  const activeVariantStack = (): LayerGroup | undefined => {
+    let id: string | null = activeLayerId;
+    for (let guard = 0; guard < 64 && id; guard++) {
+      const info = getParentInfo(session.state, id);
+      if (!info || !info.parentId) return undefined;
+      const p = getNode(session.state, info.parentId);
+      if (p && isVariantStack(p)) return p;
+      id = info.parentId;
+    }
+    return undefined;
+  };
+
+  /** , / . で、いま描いているレイヤーが属するスロットの差分を往復する（A/B の見比べ用）。 */
+  const stepActiveVariant = (delta: number) => {
+    const stack = activeVariantStack();
+    if (stack) stepVariant(stack, delta);
   };
 
   // 保留中ならしきい値超えで本ドラッグを開始。ドラッグ中は pointer 位置の直下の行を判定し、
   // 上/中/下のドロップ位置ヒントを更新する。
   const onRowPointerMove = (e: ReactPointerEvent) => {
+    // 差分スライド中: カルーセルを指に追従させ、中央の枠に来た 1 枚を覗き見する。
+    if (swipeRef.current) {
+      if (e.pointerId === swipeRef.current.pointerId) updateSwipe(e.clientX);
+      return;
+    }
     if (!dragIdRef.current) {
+      // まだ持ち上がっていない。動き出したなら、それはスライド（差分の切り替え）。
       const p = pendingDragRef.current;
       if (!p || e.pointerId !== p.pointerId) return;
-      if (Math.hypot(e.clientX - p.startX, e.clientY - p.startY) < LAYER_DRAG_THRESHOLD) return;
-      const node = getNode(session.state, p.id);
-      if (!node) {
+      if (Math.hypot(e.clientX - p.startX, e.clientY - p.startY) < LAYER_GESTURE_THRESHOLD) return;
+      const stack = getNode(session.state, p.id);
+      if (stack && isVariantStack(stack) && stack.children.length >= 2) {
+        cancelLiftTimer(); // スライドに入ったら持ち上げない（片方だけが起きる）
+        const at = variantIndexOf(stack);
+        swipeRef.current = {
+          stackId: stack.id,
+          pointerId: p.pointerId,
+          startX: p.startX,
+          baseIndex: at,
+          count: stack.children.length,
+          index: at,
+          dx: 0,
+        };
+        capturePointer(p.el, p.pointerId);
         pendingDragRef.current = null;
-        return;
+        setSwipingStackId(stack.id); // カルーセルを出す
+        updateSwipe(e.clientX); // 開始した move の移動量もその場で反映する
       }
-      // しきい値超え → 本ドラッグ開始。以降の move/up を確実に受けるためここで捕捉する。
-      dragIdRef.current = p.id;
-      try {
-        (e.currentTarget as HTMLElement).setPointerCapture(p.pointerId);
-      } catch {
-        /* 捕捉できなくても elementFromPoint 経路で継続可能 */
-      }
-      setDragGhost({ name: node.name });
-      pendingDragRef.current = null;
+      // 差分を持たない行は、動かしても何も起きない（長押しすれば持ち上がる）。
+      return;
     }
     const dragged = dragIdRef.current;
     if (!dragged) return;
@@ -1978,22 +2678,40 @@ export function CanvasEditor({
     }
     const rect = head.getBoundingClientRect();
     const r = (e.clientY - rect.top) / Math.max(1, rect.height);
-    const pos: 'above' | 'below' | 'into' = isGroup(tn)
-      ? r < 0.28
-        ? 'above'
-        : r > 0.72
-          ? 'below'
-          : 'into'
-      : r < 0.5
-        ? 'above'
-        : 'below';
+    // 掴んだ位置から横へ大きくずらしていたら「横に並べる（差分にする）」。
+    // 縦にずらしているだけなら今までどおりの並べ替え／フォルダ出し入れ。
+    const dx = e.clientX - (dragOriginRef.current?.x ?? e.clientX);
+    let pos: DropPos;
+    if (Math.abs(dx) >= VARIANT_DROP_DX) {
+      pos = dx < 0 ? 'left' : 'right';
+    } else if (isGroup(tn)) {
+      pos = r < 0.28 ? 'above' : r > 0.72 ? 'below' : 'into';
+    } else {
+      pos = r < 0.5 ? 'above' : 'below';
+    }
     setDropHint((p) => (p && p.id === targetId && p.pos === pos ? p : { id: targetId, pos }));
   };
 
   const onRowPointerUp = (e: ReactPointerEvent) => {
     pendingDragRef.current = null;
+    cancelLiftTimer();
+    // スライドの確定: 動いていれば 1 op（Undo 1 回）、動いていなければ覗き見を戻すだけ。
+    const sw = swipeRef.current;
+    if (sw) {
+      swipeRef.current = null;
+      setSwipingStackId(null); // カルーセルを畳む
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        /* 既に解放済み */
+      }
+      const stack = getNode(session.state, sw.stackId);
+      if (stack && isVariantStack(stack)) chooseVariant(stack, sw.index);
+      else clearVariantPeek();
+      return;
+    }
     const dragged = dragIdRef.current;
-    if (!dragged) return; // しきい値未満＝クリック。選択/リネーム/ボタンの通常処理に任せる。
+    if (!dragged) return; // 持ち上がる前に離した＝クリック。選択/リネーム/ボタンの通常処理に任せる。
     const hint = dropHint;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
@@ -2001,6 +2719,7 @@ export function CanvasEditor({
       /* 既に解放済み */
     }
     dragIdRef.current = null;
+    dragOriginRef.current = null;
     setDragGhost(null);
     setDropHint(null);
     if (previewing || !dragged) return;
@@ -2020,11 +2739,22 @@ export function CanvasEditor({
     }
   };
 
-  const performDrop = (draggedId: string, targetId: string, pos: 'above' | 'below' | 'into') => {
+  const performDrop = (draggedId: string, targetId: string, pos: DropPos) => {
     if (previewing || draggedId === targetId) return;
     const dn = getNode(session.state, draggedId);
     const tn = getNode(session.state, targetId);
     if (!dn || !tn || collectNodeIds(dn).includes(targetId)) return; // 子孫へは不可
+    // 行の左右の肩へ落とした = 縦に積むのではなく横に並べる（＝そのスロットの差分にする）。
+    // 相手がまだ普通のレイヤーでも、その場で横軸（差分スタック）に化ける。
+    if (pos === 'left' || pos === 'right') {
+      dropBesideAsVariant(draggedId, targetId, pos);
+      return;
+    }
+    // 差分スタック（横軸）の行の中央へ落とした = そのスロットの差分にする。
+    if (pos === 'into' && isVariantStack(tn)) {
+      dropAsVariant(draggedId, tn);
+      return;
+    }
     // 移動先の親と挿入位置を決める。
     let newParentId: string | null;
     let index: number;
@@ -2037,9 +2767,45 @@ export function CanvasEditor({
       const from = getParentInfo(session.state, draggedId);
       const sameParent = from && from.parentId === info.parentId ? from.index : null;
       newParentId = info.parentId;
-      index = reorderIndex(pos, info.index, sameParent);
+      // 差分スタックを開いた一覧は左→右を上→下にそのまま並べるので、逆順ではない。
+      const parent = info.parentId ? getNode(session.state, info.parentId) : null;
+      const reversed = !(parent && isVariantStack(parent));
+      index = reorderIndex(pos, info.index, sameParent, reversed);
     }
     moveNode(draggedId, newParentId, index);
+  };
+
+  /**
+   * 行の左右の肩へ落として「その隣の差分」にする（＝差分づくりを D&D のアフォーダンスで行う）。
+   * 相手がまだ普通のレイヤー／フォルダなら、その場で横軸（差分スタック）に包まれる。
+   * 1 ドロップ = 1 op なので Undo 1 回で元の縦積みに戻る。
+   */
+  const dropBesideAsVariant = (draggedId: string, targetId: string, side: 'left' | 'right') => {
+    if (previewing) return;
+    markDirty('full'); // 差分の入れ替えは絵の全面が変わりうる
+    session.apply(createMoveAsVariantOp(draggedId, targetId, genId('vstack'), side));
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
+  };
+
+  // 既存のレイヤーをスロットへ落として「そのスロットの差分」にする。
+  // 落としたものをそのまま表示中の差分にするので、結果が即座に見える。
+  const dropAsVariant = (draggedId: string, stack: LayerGroup) => {
+    if (previewing) return;
+    const at = variantIndexOf(stack);
+    const already = stack.children.findIndex((c) => c.id === draggedId);
+    markDirty('full');
+    if (already >= 0) {
+      // 既にこのスロットの差分 → 表示をそれに切り替えるだけ。
+      session.apply(createSetVariantIndexOp(stack.id, already));
+    } else {
+      session.applyBatch([
+        createMoveNodeOp(draggedId, stack.id, at + 1),
+        createSetVariantIndexOp(stack.id, at + 1),
+      ]);
+    }
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
   };
 
   // ノードを newParentId（null=最上位）の index へ移す（並べ替え / フォルダ出し入れ）。全ノードが
@@ -2082,18 +2848,18 @@ export function CanvasEditor({
     repaint();
   };
 
-  // アクティブレイヤーをその場でフォルダに包む。
-  const groupActiveLayer = () => {
-    if (previewing) return;
-    const layer = getActiveLayer();
-    if (!layer) return;
-    session.apply(createAddGroupOp(genId('group'), 'Folder', layer.id));
-    onEdit();
-    repaint();
-  };
-
   // レイヤー名クリック: グループは開閉、リーフはアクティブ化。
   const onLayerClick = (n: LayerNode) => {
+    // 開いたスロットの中で控えの差分をクリックしたら、それをそのスロットに出す
+    // （左右スライドと同じことを、一覧から直接選べるようにする）。
+    const inStack = getVariantStackOf(session.state, n.id);
+    if (inStack && activeVariant(inStack)?.id !== n.id) {
+      const at = inStack.children.findIndex((c) => c.id === n.id);
+      if (at >= 0) {
+        chooseVariant(inStack, at);
+        return;
+      }
+    }
     if (isGroup(n)) {
       toggleCollapse(n);
       return;
@@ -2150,9 +2916,11 @@ export function CanvasEditor({
       ? `G[${n.children.map(renderSig).join(',')}]`
       : `L${bufId(n.buffer)}@${n.offsetX},${n.offsetY}`;
 
-  const buildThumbUrl = (n: LayerNode): string => {
+  const buildThumbUrl = (node: LayerNode): string => {
     const gw = LAYER_THUMB_W * 2;
     const gh = LAYER_THUMB_H * 2;
+    // 横軸のスロットが渡されたら、いま出ている差分のサムネを出す（全差分を重ねない）。
+    const n = isVariantStack(node) ? (activeVariant(node) ?? node) : node;
     if (isGroup(n)) {
       // 子だけを透明背景で合成（クリップ/不透明度/可視を反映）。全体を縮小表示する。
       const flat = flattenState(
@@ -2179,32 +2947,78 @@ export function CanvasEditor({
 
   // レイヤーツリーを再帰描画（フォルダは折りたたみ可。表示は上=最前面なので reverse）。
   const renderNode = (n: LayerNode, depth: number, siblings: LayerNode[]) => {
-    const grp = isGroup(n) ? n : null;
-    const leaf = grp ? null : (n as Layer);
-    const editing = editingLayerId === n.id;
-    const active = !grp && n.id === activeLayerId;
-    const disableDelete = previewing || leafCount() - collectLeafIds(n).length < 1;
-    const dropCls = dropHint?.id === n.id ? ` drop-${dropHint.pos}` : '';
+    const stack = isVariantStack(n) ? n : null;
+    // スライド中はまだ確定していない差分を先に見せる（離した時点で確定）。
+    const shownIndex = stack
+      ? variantPeek?.stackId === stack.id
+        ? variantPeek.index
+        : variantIndexOf(stack)
+      : -1;
+    const node = stack ? stack.children[shownIndex] : n;
+    if (!node) return null; // 空スタック（通常は起きない）は行を出さない
+    const slotId = stack ? stack.id : node.id;
+    const grp = isGroup(node) ? node : null;
+    const leaf = grp ? null : (node as Layer);
+    const editing = editingLayerId === node.id;
+    const active = !grp && node.id === activeLayerId;
+    const disableDelete = previewing || leafCount() - collectLeafIds(node).length < 1;
+    const dropCls = dropHint?.id === slotId ? ` drop-${dropHint.pos}` : '';
+    // この行が「開いたスロットの中の1枚」なら、その親スタック（＝取り出し元）。
+    const inStack = stack ? undefined : getVariantStackOf(session.state, n.id);
+    const isShownVariant = inStack ? activeVariant(inStack)?.id === n.id : false;
     return (
       <li
-        key={n.id}
+        key={slotId}
         className={`layer-item ${grp ? 'is-group' : ''} ${active ? 'active' : ''}${
           leaf?.clipped ? ' is-clipped' : ''
+        }${stack ? ' has-variants' : ''}${
+          variantPeek?.stackId === slotId ? ' peeking' : ''
+        }${inStack ? ' is-variant' : ''}${isShownVariant ? ' is-shown-variant' : ''}${
+          dragGhost?.id === slotId ? ' lifted' : ''
         }${dropCls}`}
       >
         <div
           className="layer-head"
-          data-id={n.id}
+          data-id={slotId}
           style={{ paddingLeft: 4 + depth * 12 }}
           onPointerDown={(e) => onRowPointerDown(n, e)}
           onPointerMove={onRowPointerMove}
           onPointerUp={onRowPointerUp}
           onPointerCancel={onRowPointerUp}
+          // 長押し中にコンテキストメニューが割り込むと持ち上げが中断されるので抑止する。
+          onContextMenu={(e) => e.preventDefault()}
+          // 開いた一覧の差分行も、サムネイル帯と同じくホバーで確認・クリックで確定にする。
+          onPointerEnter={
+            inStack ? () => peekVariant(inStack, inStack.children.indexOf(n)) : undefined
+          }
+          onPointerLeave={inStack ? clearVariantPeek : undefined}
         >
-          <span className="layer-grip" title="行のどこでもドラッグで並べ替え / フォルダへ出し入れ">
-            ⠿
+          <span
+            className="layer-grip"
+            title={
+              stack
+                ? 'ここを掴むとすぐ持ち上がる（移動）／行を左右にドラッグ＝差分の切り替え／長押しでも持ち上がる'
+                : 'ここを掴むとすぐ持ち上がる（移動）／行は長押しで持ち上がる'
+            }
+          >
+            {stack ? '⇹' : '⠿'}
           </span>
-          {grp ? (
+          {/* 開閉の枠は 1 つだけ（行が横に伸びると名前が潰れるため）。
+              スロット行はスロットの開閉を優先する: 開くと中の差分が縦に並び、
+              1 枚ずつ掴んで外へ出せる（＝横軸の分解）。 */}
+          {stack ? (
+            <button
+              className="icon-btn"
+              title={
+                stack.collapsed
+                  ? `差分 ${stack.children.length} 枚を開く（1 枚ずつ掴んで外へ出せます）`
+                  : '差分を畳む'
+              }
+              onClick={() => toggleCollapse(stack)}
+            >
+              {stack.collapsed ? '▸' : '▾'}
+            </button>
+          ) : grp ? (
             <button
               className="icon-btn"
               title={grp.collapsed ? '展開' : '折りたたみ'}
@@ -2212,20 +3026,24 @@ export function CanvasEditor({
             >
               {grp.collapsed ? '▸' : '▾'}
             </button>
-          ) : (
+          ) : inStack ? null : (
             <span className="layer-indent" />
           )}
-          <button
-            className="icon-btn"
-            title={n.visible ? '表示中（クリックで非表示）' : '非表示（クリックで表示）'}
-            disabled={previewing}
-            onClick={() => toggleVisibility(n)}
-          >
-            {n.visible ? '👁' : '🚫'}
-          </button>
+          {/* 差分行では表示/非表示を出さない。控えの差分はそもそも絵に載らず、出ている 1 枚の
+              表示切替はスロット行が持っているため（同じ操作を二重に置くと名前の幅が無くなる）。 */}
+          {!inStack && (
+            <button
+              className="icon-btn"
+              title={node.visible ? '表示中（クリックで非表示）' : '非表示（クリックで表示）'}
+              disabled={previewing}
+              onClick={() => toggleVisibility(node)}
+            >
+              {node.visible ? '👁' : '🚫'}
+            </button>
+          )}
           <img
             className="layer-thumb"
-            src={layerThumb(n)}
+            src={layerThumb(node)}
             alt=""
             draggable={false}
             title="レイヤーの内容"
@@ -2236,21 +3054,25 @@ export function CanvasEditor({
               autoFocus
               value={editingName}
               onChange={(e) => setEditingName(e.target.value)}
-              onBlur={() => commitRename(n)}
+              onBlur={() => commitRename(node)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') commitRename(n);
+                if (e.key === 'Enter') commitRename(node);
                 else if (e.key === 'Escape') setEditingLayerId(null);
               }}
             />
           ) : (
             <span
               className="layer-name"
-              onClick={() => onLayerClick(n)}
-              onDoubleClick={() => startRename(n)}
-              title="クリックで選択/開閉 / ダブルクリックで名称変更"
+              onClick={() => onLayerClick(node)}
+              onDoubleClick={() => startRename(node)}
+              title={
+                inStack && !isShownVariant
+                  ? 'クリックでこの差分をスロットに出す / ダブルクリックで名称変更'
+                  : 'クリックで選択/開閉 / ダブルクリックで名称変更'
+              }
             >
               {grp ? '📁 ' : ''}
-              {n.name}
+              {node.name}
               {leaf && (leaf.offsetX !== 0 || leaf.offsetY !== 0) && (
                 <span className="muted">
                   {' '}
@@ -2260,6 +3082,20 @@ export function CanvasEditor({
             </span>
           )}
           <span className="layer-actions">
+            {stack && (
+              // 「横に何枚あって、いま何枚目か」だけを小さく出す。実際の選択はスライド（カルーセル）で行う。
+              <span
+                className="variant-count"
+                title={`差分 ${stack.children.length} 枚。行を左右にドラッグして切り替え（帯が指について動きます）`}
+              >
+                {shownIndex + 1}/{stack.children.length}
+              </span>
+            )}
+            {isShownVariant && (
+              // 開いたスロットのうち、いま絵に載っている 1 枚の印。控え側は行を薄くして示すので
+              // 印を出さない（行が横に伸びると名前の幅が無くなるため、目印は最小限にする）。
+              <span className="variant-badge on" title="いまこのスロットに出ている差分" />
+            )}
             {leaf && (
               <button
                 className={`icon-btn${leaf.clipped ? ' on' : ''}`}
@@ -2274,21 +3110,69 @@ export function CanvasEditor({
                 ⤵
               </button>
             )}
-            {!grp && (
+            {/* 差分どうしは「別の可能性」であって上下関係が無いので統合できない（canMergeDown が
+                常に false）。スロット行・差分行では押せないボタンを置かず、幅を名前に回す。 */}
+            {!grp && !inStack && !stack && (
               <button
                 className="icon-btn"
                 title="下のレイヤーと統合 (merge down)"
-                disabled={previewing || !canMergeDown(n)}
-                onClick={() => mergeDown(n)}
+                disabled={previewing || !canMergeDown(node)}
+                onClick={() => mergeDown(node)}
               >
                 ⤓
               </button>
             )}
-            <button className="icon-btn" title="削除" disabled={disableDelete} onClick={() => deleteLayer(n)}>
+            <button
+              className="icon-btn"
+              title={stack || inStack ? 'この差分を削除（残り1つになったら横軸は解除）' : '削除'}
+              disabled={disableDelete}
+              onClick={() =>
+                stack
+                  ? removeVariant(stack, node)
+                  : inStack
+                    ? removeVariant(inStack, n)
+                    : deleteLayer(node)
+              }
+            >
               🗑
             </button>
           </span>
         </div>
+        {/* 左右スライド中だけ出るカルーセル。行の上に重ねるので（position:absolute）
+            レイアウトはびくとも動かず、指の動きにサムネイルがそのまま付いてくる。
+            中央の枠に来ている 1 枚がキャンバスにも出ていて、離すとそれで確定する。
+            「何段ドラッグすれば隣へ行くか」が絵で見えるので、見えない数え上げにならない。 */}
+        {stack && swipingStackId === stack.id && (
+          <div className="variant-carousel">
+            <div
+              className="vc-track"
+              ref={carouselTrackRef}
+              style={{
+                transform: carouselTransform(swipeRef.current ?? { baseIndex: shownIndex, dx: 0 }),
+              }}
+            >
+              {stack.children.map((c, i) => (
+                <span key={c.id} className={`vc-chip${i === shownIndex ? ' on' : ''}`}>
+                  <img src={layerThumb(c)} alt="" draggable={false} />
+                </span>
+              ))}
+            </div>
+            <div className="vc-frame" />
+            <span className="vc-label">
+              {shownIndex + 1}/{stack.children.length} {stack.children[shownIndex]?.name ?? ''}
+            </span>
+          </div>
+        )}
+        {/* 開いたスロットの中身。左→右の並びをそのまま上→下に出す（帯の並びと一致させる）。
+            各行は普通のレイヤー行なので、掴んで外へドラッグすればスロットから出せる＝分解になる。 */}
+        {stack && !stack.collapsed && (
+          <ul className="layer-list nested variants">
+            <li className="variant-list-cap">
+              横に並ぶ差分（この中の 1 枚だけが絵に載ります）— 掴んで外へ出すと普通のレイヤーに戻ります
+            </li>
+            {stack.children.map((c) => renderNode(c, depth + 1, stack.children))}
+          </ul>
+        )}
         {grp && !grp.collapsed && (
           <ul className="layer-list nested">
             {grp.children
@@ -2389,6 +3273,15 @@ export function CanvasEditor({
               }}
               onPointerLeave={() => setHovering(false)}
             />
+            {/* 選択範囲の点線と投げ縄ドラッグを描く重ね canvas。絵の canvas を汚さないので、
+                点線を動かしても投げ縄を引いてもレイヤー合成をやり直さずに済む（当たり判定は持たない）。 */}
+            <canvas
+              ref={selCanvasRef}
+              className="selection-overlay"
+              width={width}
+              height={height}
+              style={{ width, height }}
+            />
           </div>
         </div>
           {/* リサイズ・ドラッグ中に出す破線プレビュー枠（アートボード原点 0,0 起点）。大きさは命令的に更新。 */}
@@ -2432,15 +3325,22 @@ export function CanvasEditor({
           width: size * zoom,
           height: size * zoom,
           display: showCursor && hovering && !previewing ? 'block' : 'none',
-          borderColor: sizeAdjust ? '#56ccf2' : tool === 'eraser' ? '#fff' : color,
+          // 消す一筆（消しゴム or 透明色）は白いリングで「色を置かない」ことを示す。
+          borderColor: sizeAdjust ? '#56ccf2' : erasing ? '#fff' : color,
         }}
       >
         {sizeAdjust && <span className="brush-cursor-label">{size}px</span>}
       </div>
 
-      {/* レイヤー D&D 中に pointer へ追従する半透明ゴースト（マウス/ペン/タッチ共通）。 */}
+      {/* レイヤー D&D 中に pointer へ追従する半透明ゴースト（マウス/ペン/タッチ共通）。
+          行の左右の肩に来ているときは「差分になる」ことをその場で言葉でも示す。 */}
       <div ref={ghostRef} className="layer-drag-ghost" style={{ display: dragGhost ? 'block' : 'none' }}>
         {dragGhost?.name}
+        {(dropHint?.pos === 'left' || dropHint?.pos === 'right') && (
+          <span className="drag-ghost-badge">
+            {dropHint.pos === 'left' ? '← 差分にする' : '差分にする →'}
+          </span>
+        )}
       </div>
 
       {previewing && (
@@ -2484,33 +3384,70 @@ export function CanvasEditor({
         <Section title="TOOLS" defaultOpen>
           <div className="tool-row">
             <button onClick={doUndo} disabled={!session.canUndo() || previewing} title="Undo (Ctrl+Z)">
-              ↶ Undo
+              <ToolIcon name="undo" size={15} /> Undo
             </button>
             <button
               onClick={doRedo}
               disabled={!session.canRedo() || previewing}
               title="Redo (Ctrl+Shift+Z)"
             >
-              ↷ Redo
+              <ToolIcon name="redo" size={15} /> Redo
             </button>
           </div>
-          <div className="tool-row">
-            {TOOLS.map((t) => (
+
+          {/* ツールパレット: 役割ごとに小見出しを付けたアイコングリッド。
+              名前・ショートカット・説明は title（ツールチップ）に入れ、盤面は記号だけで済ませる。 */}
+          {TOOL_GROUPS.map((g) => (
+            <div className="tool-group" key={g.label}>
+              <div className="tool-group-label">{g.label}</div>
+              <div className="tool-grid">
+                {g.tools.map((t) => (
+                  <button
+                    key={t.id}
+                    className={`tool-btn${tool === t.id ? ' active' : ''}`}
+                    onClick={() => setTool(t.id)}
+                    title={`${t.label}（${t.key}）\n${t.hint}`}
+                    aria-label={t.label}
+                    aria-pressed={tool === t.id}
+                  >
+                    <ToolIcon name={t.icon} />
+                    <span className="tool-btn-key">{t.key}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+          <div className="tool-current">{toolLabel}</div>
+
+          {/* 選択範囲の状態。ある間だけ出す（無いときは「全面に描ける」＝説明する必要がない）。 */}
+          {selectionInfo && (
+            <div className="selection-bar">
+              <ToolIcon name="lassoSelect" size={14} />
+              <span className="selection-bar-text">
+                選択中 {selectionInfo.w}×{selectionInfo.h}（{selectionInfo.area.toLocaleString()}px）
+              </span>
               <button
-                key={t.id}
-                className={tool === t.id ? 'active' : ''}
-                onClick={() => setTool(t.id)}
-                title={`${t.label} (${t.key})`}
+                className="icon-btn"
+                onClick={clearSelection}
+                disabled={previewing}
+                title="選択解除 (Ctrl+D)"
               >
-                {t.label} <span className="key-hint">{t.key}</span>
+                <ToolIcon name="deselect" size={14} /> 解除
               </button>
-            ))}
-          </div>
+            </div>
+          )}
+          {(tool === 'lassoSelect' || tool === 'lassoFill') && (
+            <p className="hint">
+              {tool === 'lassoSelect'
+                ? '囲った内側だけが描ける状態になります。Shift=追加 / Alt=削除 / Shift+Alt=交差／Ctrl+D=解除。'
+                : '囲った内側を現在の色で塗ります。線が閉じていない下描きでも思った範囲に色を置けます。'}
+            </p>
+          )}
           {showCursor && (
             <>
               <label className="field">
                 <span>
-                  {tool} size {size}px
+                  {toolLabel} の太さ {size}px
                 </span>
                 <input
                   type="range"
@@ -2555,9 +3492,61 @@ export function CanvasEditor({
             </p>
           )}
           <p className="hint">
-            B=Brush E=Eraser G=Fill I=Pick L=Line R=Rect V=Transform Q=Inspect／
-            S押下＋上下ドラッグ or [ ]=サイズ／Ctrl+Z=Undo Ctrl+Shift+Z=Redo
+            B=ブラシ N=Gペン P=鉛筆 A=エア E=消しゴム G=塗りつぶし U=投げ縄塗り I=スポイト
+            L=直線 R=矩形 M=投げ縄選択 V=変形 Q=履歴しらべ／
+            S押下＋上下ドラッグ or [ ]=サイズ／X=メイン⇄サブ C=透明／, .=差分の切替／
+            Ctrl+Z=Undo Ctrl+Shift+Z=Redo Ctrl+D=選択解除
           </p>
+
+          {/* ツールプロパティ: いま選んでいる筆の質感を直接いじる。値は描いた op に焼き込まれるので、
+              ここを後から変えても、既に描いた線の見た目は変わらない（履歴と絵が食い違わない）。 */}
+          <div className="tool-props">
+            <div className="tool-props-head">
+              <span>ツールプロパティ{isPaintTool(tool) ? ` · ${toolLabel}` : ''}</span>
+              {isPaintTool(tool) && (
+                <button
+                  className="icon-btn"
+                  title={`${toolLabel} の質感を初期プリセットに戻す`}
+                  disabled={sameSettings(brushSet, BRUSH_DEFAULTS[brushType])}
+                  onClick={resetBrushTuning}
+                >
+                  ↺ リセット
+                </button>
+              )}
+            </div>
+            {isPaintTool(tool) ? (
+              <>
+                {BRUSH_SETTING_FIELDS.map((f) => {
+                  // ぼかし>0 のときは減衰曲線が縁を決めるので「縁の締まり」は効かない。
+                  const disabled = f.key === 'edge' && brushSet.soft > 0;
+                  return (
+                    <label className={`field tool-prop${disabled ? ' off' : ''}`} key={f.key} title={f.hint}>
+                      <span>
+                        {f.label} {brushSet[f.key]}
+                      </span>
+                      <input
+                        type="range"
+                        min={f.min}
+                        max={f.max}
+                        step={f.step}
+                        value={brushSet[f.key]}
+                        disabled={disabled}
+                        onChange={(e) => setBrushField(f.key, Number(e.target.value))}
+                      />
+                    </label>
+                  );
+                })}
+                <p className="hint">
+                  数値は描いた瞬間に操作へ焼き込まれます。あとでここを動かしても、
+                  すでに描いた線の見た目は変わりません（Undo/Verify と食い違わないため）。
+                </p>
+              </>
+            ) : (
+              <p className="hint">
+                調整できる質感を持つのは筆（Brush / Gペン / 鉛筆 / エア）だけです。
+              </p>
+            )}
+          </div>
         </Section>
 
         <Section title="CANVAS" defaultOpen={false}>
@@ -2614,6 +3603,40 @@ export function CanvasEditor({
         </Section>
 
         <Section title="COLOR" defaultOpen>
+          {/* メイン / サブ / 透明 の3枠。透明は色ではなく「アルファを削る」指定なので、
+              選ぶといま持っている筆がその質感のまま消しゴムとして働く。 */}
+          <div className="color-slots">
+            <button
+              className={`color-slot${colorSlot === 'main' ? ' active' : ''}`}
+              style={{ background: mainColor }}
+              onClick={() => setColorSlot('main')}
+              title="メインカラー（X でサブと切り替え）"
+            >
+              <span className="color-slot-label">メイン</span>
+            </button>
+            <button
+              className={`color-slot${colorSlot === 'sub' ? ' active' : ''}`}
+              style={{ background: subColor }}
+              onClick={() => setColorSlot('sub')}
+              title="サブカラー（X でメインと切り替え）"
+            >
+              <span className="color-slot-label">サブ</span>
+            </button>
+            <button
+              className={`color-slot color-slot-transparent${
+                colorSlot === 'transparent' ? ' active' : ''
+              }`}
+              onClick={() => setColorSlot('transparent')}
+              title="透明色（C で切り替え）: 色を置かずにアルファを削る。いまの筆がその質感のまま消しゴムになる"
+            >
+              <span className="color-slot-label">透明</span>
+            </button>
+          </div>
+          <p className="hint">
+            X=メイン⇄サブ／C=透明⇄色。透明は
+            {transparentInk ? `いま有効（${toolLabel}がその質感のまま消しゴムになります）` : '色ではなく透過を塗ります'}。
+          </p>
+          {/* ピッカーが編集するのは「いま選んでいる色枠」。透明を選んだまま色を触ったら色枠へ戻す。 */}
           <ColorPicker color={color} onChange={setColor} />
         </Section>
 
@@ -2697,21 +3720,90 @@ export function CanvasEditor({
         className="float-layers"
       >
         <Section title="LAYERS" defaultOpen>
+          {/* レイヤー操作。どれもアクティブレイヤー（＝いま描いている1枚）に効く。
+              各行にも同じ操作のボタンはあるが、行のボタンは幅の都合で最小限しか置けないので、
+              よく使うものはここに揃えて「いまの1枚に何ができるか」を一望できるようにする。 */}
+          <div className="tool-group-label">レイヤー操作</div>
+          {(() => {
+            const al = getActiveLayer();
+            // クリップは「解除」も含めてトグル。まだ付いていないのに下地が無い時だけ押せない。
+            const clipEnabled = !!al && (al.clipped || canClip(al));
+            return (
+              <div className="layer-ops">
+                <LayerOpButton
+                  icon="layerAdd"
+                  label="レイヤー"
+                  title="新しいレイヤーを最上位に追加して、それをアクティブにする"
+                  onClick={addLayer}
+                  disabled={previewing}
+                />
+                <LayerOpButton
+                  icon="folderAdd"
+                  label="フォルダ"
+                  title="空のフォルダを最上位に追加（行を持ち上げて中央へ落とすと収納できる）"
+                  onClick={addFolder}
+                  disabled={previewing}
+                />
+                <LayerOpButton
+                  icon="clip"
+                  label="クリップ"
+                  title={
+                    !al
+                      ? 'レイヤーを選んでください（フォルダにはクリップできません）'
+                      : al.clipped
+                        ? 'クリッピングを解除する'
+                        : clipEnabled
+                          ? '下のレイヤーにクリップ (clipping mask): 下地のある所にだけ描いた色が乗る'
+                          : '直下にレイヤーが無いためクリップできません'
+                  }
+                  onClick={() => al && toggleClip(al)}
+                  disabled={previewing || !clipEnabled}
+                  on={!!al?.clipped}
+                />
+                <LayerOpButton
+                  icon="mergeDown"
+                  label="下と結合"
+                  title={
+                    al && canMergeDown(al)
+                      ? '下のレイヤーと統合 (merge down): 2枚を1枚に焼き付ける'
+                      : '下に統合できるレイヤーがありません（フォルダ・差分の中は対象外）'
+                  }
+                  onClick={() => al && mergeDown(al)}
+                  disabled={previewing || !al || !canMergeDown(al)}
+                />
+                <LayerOpButton
+                  icon="variantAdd"
+                  label="差分追加"
+                  title="アクティブレイヤーの横に、空の差分レイヤーを増やす（＝そのスロットに横軸を持たせる）。横に並ぶ差分は同時には存在せず、行を左右にスライドして切り替える"
+                  onClick={() => addVariant(false)}
+                  disabled={previewing}
+                />
+                <LayerOpButton
+                  icon="variantCopy"
+                  label="差分複製"
+                  title="いまの内容を複製して、その複製を新しい差分として横に増やす（案A を少し変えた案B を作る用）"
+                  onClick={() => addVariant(true)}
+                  disabled={previewing}
+                />
+                <LayerOpButton
+                  icon="layerClear"
+                  label="全消去"
+                  title="アクティブレイヤーの中身を全部消す（レイヤー自体は残る。Undo で戻せます）"
+                  onClick={clearActiveLayer}
+                  disabled={previewing || !al}
+                />
+              </div>
+            );
+          })()}
+          {/* 読み込み・書き出しはレイヤー構造をいじる操作ではない（PSD に至ってはドキュメントごと
+              差し替わる）ので、レイヤー操作とは列を分けて置く。 */}
+          <div className="tool-group-label">読み込み・書き出し</div>
           <div className="tool-row">
-            <button onClick={addLayer} disabled={previewing}>
-              + Layer
-            </button>
-            <button onClick={addFolder} disabled={previewing} title="空のフォルダを最上位に追加">
-              + Folder
-            </button>
             <button
-              onClick={groupActiveLayer}
+              onClick={() => imageInputRef.current?.click()}
               disabled={previewing}
-              title="アクティブレイヤーを新規フォルダで包む（中身入りフォルダを一発で作る）"
+              title="画像ファイルを新規レイヤーとして読み込む（キャンバスに収まるよう縮小して中央に置く）"
             >
-              Wrap
-            </button>
-            <button onClick={() => imageInputRef.current?.click()} disabled={previewing}>
               Import
             </button>
             <button
@@ -2723,9 +3815,6 @@ export function CanvasEditor({
             </button>
             <button onClick={exportPng} title="現在の合成を PNG 保存">
               PNG
-            </button>
-            <button onClick={clearActiveLayer} disabled={previewing} title="アクティブレイヤーを全消去">
-              Clear
             </button>
           </div>
           <input
@@ -2780,7 +3869,30 @@ export function CanvasEditor({
               .map((n) => renderNode(n, 0, session.state.layers))}
           </ul>
           <p className="hint">
-            ⠿ をドラッグで並べ替え（ペン/タッチ可）。フォルダの中央に落とすと収納、余白に落とすと最上位へ。
+            <b>行の掴み方</b>: 移動（並べ替え・フォルダ出し入れ・差分化）と、差分の左右スライドは、
+            <b>向きではなく時間で分かれます</b>。<b>押してすぐ横へ動かす＝スライド</b>、
+            <b>押したまま少し待つ＝持ち上がって移動</b>。⠿ を掴めば待たずに持ち上がります。
+          </p>
+          <p className="hint">
+            <b>横軸（差分）を作る</b>: 行を持ち上げてから<b>横へずらして</b>別の行へ落とすと、
+            縦に積まずにその行の<b>隣に並ぶ差分</b>になります。緑の縦棒が出た側（左/右）に入り、
+            相手がまだ普通のレイヤーでも自動で横軸に化けます。持ち上げてまっすぐ縦なら並べ替えです。
+            上の<b>差分追加 / 差分複製</b>でも同じものが作れます（空 / 複製の差分を増やす）。
+          </p>
+          <p className="hint">
+            <b>横軸（差分）を切り替える</b>: ⇹ 行を<b>左右にドラッグ</b>すると並列の差分が出てきます。
+            行の下のサムネイルは<b>ホバーで確認・クリックで確定</b>（ホバー中は履歴に残りません）。
+            <b>, / .</b> キーでも往復できるので、A と B をパタパタ見比べられます。
+            横に並ぶ差分は互いに独立で、出ている 1 枚だけが絵に載ります。
+          </p>
+          <p className="hint">
+            <b>横軸をほどく</b>: ⇹ 行の ▸ を押すと中の差分が縦に並びます。そこから 1 枚
+            <b>持ち上げて外へ</b>出せば、スロットを出て普通のレイヤーに戻ります（＝分解）。
+            控えの行をクリックすればその差分に切り替わり、🗑 で 1 枚捨てられます。
+            差分が 1 枚だけになった時点で横軸は自動的に解けます。
+          </p>
+          <p className="hint">
+            持ち上げた行はフォルダの中央に落とすと収納、余白に落とすと最上位へ（ペン/タッチ可）。
             ⤵ で下のレイヤーにクリップ。
           </p>
         </Section>

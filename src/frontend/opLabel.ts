@@ -5,9 +5,11 @@ export function describeOp(op: Operation): string {
   const p = op.params as Record<string, unknown>;
   switch (op.type) {
     case 'brush':
-      return `rgb(${(p.color as number[]).join(',')}) size${p.size} · ${op.strokes?.length ?? 0}pts`;
+      return `${(p.brushType as string) ?? 'pen'} rgb(${(p.color as number[]).join(',')}) size${
+        p.size
+      } · ${op.strokes?.length ?? 0}pts`;
     case 'eraser':
-      return `size${p.size} · ${op.strokes?.length ?? 0}pts`;
+      return `${(p.brushType as string) ?? 'pen'} 透明 size${p.size} · ${op.strokes?.length ?? 0}pts`;
     case 'translate':
       return `dx${p.dx} dy${p.dy}`;
     case 'brightness':
@@ -38,8 +40,30 @@ export function describeOp(op: Operation): string {
       return p.parentId ? `→ into ${p.parentId}` : '→ top';
     case 'setGroupCollapsed':
       return p.collapsed ? 'collapse' : 'expand';
+    case 'addVariant':
+      return `${p.copy ? 'copy' : 'new'} variant "${p.name}"`;
+    case 'setVariantIndex':
+      return `slide → ${(p.index as number) + 1}`;
+    case 'removeVariant':
+      return 'remove variant';
+    case 'moveAsVariant':
+      return `${p.side === 'left' ? '←' : '→'} ${p.targetId} の差分へ`;
     case 'fill':
-      return `rgb(${(p.color as number[]).join(',')}) tol${p.tolerance}`;
+      return p.erase
+        ? `透明 tol${p.tolerance}`
+        : `rgb(${(p.color as number[]).join(',')}) tol${p.tolerance}`;
+    case 'lassoFill': {
+      const pts = ((p.path as number[])?.length ?? 0) / 2;
+      return p.erase ? `透明 · ${pts}pts` : `rgb(${(p.color as number[]).join(',')}) · ${pts}pts`;
+    }
+    case 'setSelection': {
+      const mode = (p.mode as string) ?? 'replace';
+      const label =
+        mode === 'add' ? '追加' : mode === 'subtract' ? '削除' : mode === 'intersect' ? '交差' : '新規';
+      return `${label} · ${((p.path as number[])?.length ?? 0) / 2}pts`;
+    }
+    case 'clearSelection':
+      return '選択解除';
     case 'transform': {
       const a = p.a as number;
       const b = p.b as number;

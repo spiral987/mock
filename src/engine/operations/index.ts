@@ -22,9 +22,17 @@ import {
   setGroupCollapsedHandler,
 } from './layerOps';
 import { fillHandler } from './fill';
+import { lassoFillHandler } from './lassoFill';
+import { setSelectionHandler, clearSelectionHandler } from './selectionOps';
 import { transformHandler } from './transform';
 import { baselineHandler } from './baseline';
 import { canvasSizeHandler } from './canvasSize';
+import {
+  addVariantHandler,
+  setVariantIndexHandler,
+  removeVariantHandler,
+  moveAsVariantHandler,
+} from './variantOps';
 
 registerOp(brushHandler);
 registerOp(eraserHandler);
@@ -45,9 +53,16 @@ registerOp(moveNodeHandler);
 registerOp(addGroupHandler);
 registerOp(setGroupCollapsedHandler);
 registerOp(fillHandler);
+registerOp(lassoFillHandler);
+registerOp(setSelectionHandler);
+registerOp(clearSelectionHandler);
 registerOp(transformHandler);
 registerOp(baselineHandler);
 registerOp(canvasSizeHandler);
+registerOp(addVariantHandler);
+registerOp(setVariantIndexHandler);
+registerOp(removeVariantHandler);
+registerOp(moveAsVariantHandler);
 
 export { brushHandler, createBrushOp, type BrushParams } from './brush';
 export { eraserHandler, createEraserOp, type EraserParams } from './eraser';
@@ -85,6 +100,28 @@ export {
   type SetGroupCollapsedParams,
 } from './layerOps';
 export { fillHandler, createFillOp, fillRegion, type FillParams } from './fill';
+export { lassoFillHandler, createLassoFillOp, type LassoFillParams } from './lassoFill';
+export {
+  setSelectionHandler,
+  createSetSelectionOp,
+  clearSelectionHandler,
+  createClearSelectionOp,
+  type SetSelectionParams,
+} from './selectionOps';
 export { transformHandler, createTransformOp, type TransformParams } from './transform';
 export { baselineHandler, createBaselineOp, type BaselineParams } from './baseline';
 export { canvasSizeHandler, createSetCanvasSizeOp, type CanvasSizeParams } from './canvasSize';
+export {
+  addVariantHandler,
+  createAddVariantOp,
+  setVariantIndexHandler,
+  createSetVariantIndexOp,
+  removeVariantHandler,
+  createRemoveVariantOp,
+  moveAsVariantHandler,
+  createMoveAsVariantOp,
+  type AddVariantParams,
+  type SetVariantIndexParams,
+  type RemoveVariantParams,
+  type MoveAsVariantParams,
+} from './variantOps';

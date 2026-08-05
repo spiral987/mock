@@ -22,6 +22,59 @@ export function createGroup(id: string, name: string): LayerGroup {
   return { id, name, visible: true, opacity: 1, collapsed: false, children: [] };
 }
 
+// ---- 差分スタック（レイヤーの横軸） ---------------------------------------
+// 「1つのスロットに、互いに排他な差分を左右に並べる」ためのグループ。children[variantIndex]
+// だけが実体としてそこに在り、他は存在しない。縦軸(z順)の道具をそのまま流用できるよう
+// LayerGroup の一種として表現しているので、移動/削除/リネーム/D&D は既存経路で動く。
+
+/** ノードが差分スタック（横軸を持つスロット）か。 */
+export function isVariantStack(node: LayerNode): node is LayerGroup {
+  return isGroup(node) && node.variantIndex !== undefined;
+}
+
+/** variantIndex を children の範囲へクランプした実効インデックス（空なら -1）。 */
+export function variantIndexOf(stack: LayerGroup): number {
+  if (stack.children.length === 0) return -1;
+  const i = Math.trunc(stack.variantIndex ?? 0);
+  return Math.max(0, Math.min(stack.children.length - 1, i));
+}
+
+/** いま「そこに在る」差分（＝合成・UI 表示の実体）。空スタックなら undefined。 */
+export function activeVariant(stack: LayerGroup): LayerNode | undefined {
+  const i = variantIndexOf(stack);
+  return i < 0 ? undefined : stack.children[i];
+}
+
+/**
+ * スロットを解決して、そこに実際に在るノードを返す（差分スタックの入れ子も辿る）。
+ * スタックごと非表示なら null（スロットに何も無い）。スタックでなければそのまま返す。
+ */
+export function resolveSlot(node: LayerNode): LayerNode | null {
+  let cur: LayerNode | undefined = node;
+  while (cur && isVariantStack(cur)) {
+    if (!cur.visible || cur.opacity <= 0) return null;
+    cur = activeVariant(cur);
+  }
+  return cur ?? null;
+}
+
+/**
+ * 差分スタックを作る（スロットの容れ物なので visible/opacity は固定）。
+ * collapsed=true が既定: 畳んだ状態＝「1 スロット 1 行」で、いま出ている差分だけが見える。
+ * 開くと中の差分が縦に並び、1 枚ずつ掴んで外へ出せる（＝横軸の分解）。
+ */
+export function createVariantStack(id: string, children: LayerNode[], index: number): LayerGroup {
+  return {
+    id,
+    name: 'Variants',
+    visible: true,
+    opacity: 1,
+    collapsed: true,
+    children,
+    variantIndex: Math.max(0, Math.min(Math.max(0, children.length - 1), index)),
+  };
+}
+
 /** ノード以下の全リーフ(Layer)の id を集める。 */
 export function collectLeafIds(node: LayerNode): string[] {
   if (!isGroup(node)) return [node.id];

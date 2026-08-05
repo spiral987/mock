@@ -1,4 +1,5 @@
 import type { ImageBuffer, StrokePoint } from '../types';
+import type { BrushProfile } from './brushProfile';
 
 /** 1ピクセルに対する書き込みコールバック。alpha は 0..1 のカバレッジ。 */
 export type StampFn = (buf: ImageBuffer, x: number, y: number, alpha: number) => void;
@@ -13,8 +14,19 @@ export type StampFn = (buf: ImageBuffer, x: number, y: number, alpha: number) =>
  * 誤差があっても「内部=必ず全カバレッジ(=1.0)」が厳密に成立し、従来の per-pixel 実装と
  * ビット同一の出力になる（外周 AA は従来と同じ式で計算）。replay 決定性・統合不変条件に影響しない。
  */
-function stampCircle(buf: ImageBuffer, cx: number, cy: number, radius: number, stamp: StampFn): void {
+function stampCircle(
+  buf: ImageBuffer,
+  cx: number,
+  cy: number,
+  radius: number,
+  stamp: StampFn,
+  edge: number,
+  flow: number,
+): void {
   if (radius <= 0) return;
+  // AA 幅の逆数。edge=1（従来のペン）では invEdge=1 となり、乗算 x*1 は IEEE754 で厳密に x なので
+  // 従来の式 (radius - dist + 0.5) とビット同一の結果になる。flow=1 も同様。
+  const invEdge = 1 / edge;
   const x0 = Math.floor(cx - radius - 1);
   const x1 = Math.ceil(cx + radius + 1);
   const y0 = Math.floor(cy - radius - 1);
@@ -37,15 +49,64 @@ function stampCircle(buf: ImageBuffer, cx: number, cy: number, radius: number, s
     for (let x = x0; x <= x1; x++) {
       if (x >= xsL && x <= xsR) {
         // 内部: 従来も coverage>1 → 1.0 をスタンプしていた。sqrt を省いて同じ 1.0 を書く。
-        stamp(buf, x, y, 1);
+        stamp(buf, x, y, flow);
         continue;
       }
       const dx = x + 0.5 - cx;
       const dist = Math.sqrt(dx * dx + dy2);
-      const coverage = radius - dist + 0.5; // 1px 幅のアンチエイリアス
-      if (coverage > 0) stamp(buf, x, y, coverage > 1 ? 1 : coverage);
+      const coverage = (radius - dist) * invEdge + 0.5; // edge px 幅のアンチエイリアス
+      if (coverage > 0) stamp(buf, x, y, (coverage > 1 ? 1 : coverage) * flow);
     }
   }
+}
+
+/**
+ * 縁がぼけた dab をスタンプする（エアブラシ用）。カバレッジは中心からの距離比 t を
+ * profile.falloff に通して決まるので、硬い円の AA とは別経路。内部一様の高速パスは無い
+ * （どの画素も距離に依存するため）。
+ */
+function stampSoftCircle(
+  buf: ImageBuffer,
+  cx: number,
+  cy: number,
+  radius: number,
+  stamp: StampFn,
+  falloff: (t: number) => number,
+  flow: number,
+): void {
+  if (radius <= 0) return;
+  const x0 = Math.floor(cx - radius - 1);
+  const x1 = Math.ceil(cx + radius + 1);
+  const y0 = Math.floor(cy - radius - 1);
+  const y1 = Math.ceil(cy + radius + 1);
+  const inv = 1 / radius;
+  for (let y = y0; y <= y1; y++) {
+    const dy = y + 0.5 - cy;
+    const dy2 = dy * dy;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      const t = Math.sqrt(dx * dx + dy2) * inv;
+      if (t >= 1) continue;
+      const cov = falloff(t);
+      if (cov > 0) stamp(buf, x, y, (cov > 1 ? 1 : cov) * flow);
+    }
+  }
+}
+
+/** 1 dab を筆の性格に従って置く（硬い円 or ぼけた円）。 */
+function stampProfiled(
+  buf: ImageBuffer,
+  cx: number,
+  cy: number,
+  radius: number,
+  pressure: number,
+  profile: BrushProfile,
+  stamp: StampFn,
+): void {
+  const flow = profile.flowAt(pressure);
+  if (flow <= 0) return;
+  if (profile.falloff) stampSoftCircle(buf, cx, cy, radius, stamp, profile.falloff, flow);
+  else stampCircle(buf, cx, cy, radius, stamp, profile.edge, flow);
 }
 
 /**
@@ -59,8 +120,18 @@ export function stampDab(
   offsetX: number,
   offsetY: number,
   stamp: StampFn,
+  profile: BrushProfile,
 ): void {
-  stampCircle(buf, p.x - offsetX, p.y - offsetY, baseRadius * p.pressure, stamp);
+  // 単独点には「速さ」が無いので speedFactor は掛からない（区間ではないため）。
+  stampProfiled(
+    buf,
+    p.x - offsetX,
+    p.y - offsetY,
+    profile.radiusAt(baseRadius, p.pressure),
+    p.pressure,
+    profile,
+    stamp,
+  );
 }
 
 /**
@@ -79,19 +150,22 @@ export function rasterizeSegment(
   offsetX: number,
   offsetY: number,
   stamp: StampFn,
+  profile: BrushProfile,
 ): void {
   const dx = p1.x - p0.x;
   const dy = p1.y - p0.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
   const minPr = Math.max(0.05, Math.min(p0.pressure, p1.pressure));
-  const spacing = Math.max(0.35, baseRadius * minPr * 0.35);
+  const spacing = Math.max(0.35, profile.radiusAt(baseRadius, minPr) * profile.spacingRatio);
   const steps = Math.max(1, Math.ceil(dist / spacing));
+  // 速さによる細り（Gペンの入り抜き）。区間の移動距離だけで決まるので replay 決定的。
+  const speed = profile.speedFactor ? profile.speedFactor(dist) : 1;
   for (let s = 1; s <= steps; s++) {
     const t = s / steps;
     const cx = p0.x + dx * t - offsetX;
     const cy = p0.y + dy * t - offsetY;
     const pr = p0.pressure + (p1.pressure - p0.pressure) * t;
-    stampCircle(buf, cx, cy, baseRadius * pr, stamp);
+    stampProfiled(buf, cx, cy, profile.radiusAt(baseRadius, pr) * speed, pr, profile, stamp);
   }
 }
 
@@ -112,16 +186,17 @@ export function rasterizeStroke(
   offsetX: number,
   offsetY: number,
   stamp: StampFn,
+  profile: BrushProfile,
 ): void {
   if (strokes.length === 0) return;
   for (let i = 0; i < strokes.length; i++) {
     const p = strokes[i];
     if (i === 0 || p.down) {
       // サブストロークの開始: 点を1回スタンプ（前点との接続線は引かない）。
-      stampDab(buf, p, baseRadius, offsetX, offsetY, stamp);
+      stampDab(buf, p, baseRadius, offsetX, offsetY, stamp, profile);
       continue;
     }
     // 同一サブストローク内の継続点: 直前点との区間を spacing 間隔で補間してスタンプ。
-    rasterizeSegment(buf, strokes[i - 1], p, baseRadius, offsetX, offsetY, stamp);
+    rasterizeSegment(buf, strokes[i - 1], p, baseRadius, offsetX, offsetY, stamp, profile);
   }
 }

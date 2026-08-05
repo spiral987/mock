@@ -8,14 +8,25 @@
  * @param pos 視覚上、対象ノードの above(上) か below(下) か。
  * @param targetIndex 対象ノードの、親 children 配列内インデックス。
  * @param fromIndexSameParent ドラッグ元が同じ親にある場合その元インデックス、別親なら null。
+ * @param displayReversed リストが配列と逆順に並んでいるか。縦軸(z順)のレイヤーは
+ *   「上=最前面」で逆順に描くので true。差分スタックを開いた一覧は左→右をそのまま
+ *   上→下に並べるので false（並びと配列の向きが一致する）。
  */
 export function reorderIndex(
   pos: 'above' | 'below',
   targetIndex: number,
   fromIndexSameParent: number | null,
+  displayReversed = true,
 ): number {
   // 逆順表示: 視覚 above（前面側）= 配列で index 大 → targetIndex+1。
-  let idx = pos === 'above' ? targetIndex + 1 : targetIndex;
+  // 同順表示: 視覚 above（手前＝小さい index 側）= targetIndex そのもの。
+  let idx = displayReversed
+    ? pos === 'above'
+      ? targetIndex + 1
+      : targetIndex
+    : pos === 'above'
+      ? targetIndex
+      : targetIndex + 1;
   // 同一親で元が挿入位置より前なら、除去で 1 つ詰まる。
   if (fromIndexSameParent !== null && fromIndexSameParent < idx) idx -= 1;
   return idx;
