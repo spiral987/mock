@@ -19,7 +19,7 @@ export function isGroup(node: LayerNode): node is LayerGroup {
 }
 
 export function createGroup(id: string, name: string): LayerGroup {
-  return { id, name, visible: true, opacity: 1, collapsed: false, children: [] };
+  return { id, name, visible: true, opacity: 1, children: [] };
 }
 
 // ---- 差分スタック（レイヤーの横軸） ---------------------------------------
@@ -60,8 +60,8 @@ export function resolveSlot(node: LayerNode): LayerNode | null {
 
 /**
  * 差分スタックを作る（スロットの容れ物なので visible/opacity は固定）。
- * collapsed=true が既定: 畳んだ状態＝「1 スロット 1 行」で、いま出ている差分だけが見える。
- * 開くと中の差分が縦に並び、1 枚ずつ掴んで外へ出せる（＝横軸の分解）。
+ * 既定では畳んで表示される＝「1 スロット 1 行」で、いま出ている差分だけが見える
+ * （畳んでいるかどうかは UI 側のローカルな状態。types.ts の LayerGroup のコメント参照）。
  */
 export function createVariantStack(id: string, children: LayerNode[], index: number): LayerGroup {
   return {
@@ -69,10 +69,26 @@ export function createVariantStack(id: string, children: LayerNode[], index: num
     name: 'Variants',
     visible: true,
     opacity: 1,
-    collapsed: true,
     children,
     variantIndex: Math.max(0, Math.min(Math.max(0, children.length - 1), index)),
   };
+}
+
+/**
+ * 空スロット（「何も無い」を選べる中身にしたもの）。中身の無いフォルダなので合成は何も出さない。
+ *
+ * これがあると、行を消す手段が 2 つある状態を解消できる:
+ *   - 一時的に行ごと消す   → スロット（行）の visible。全状態に効く、その場かぎりの操作
+ *   - この状態では出さない → 空スロットに所属させる。維持される関係（規則4 の実体）
+ * 差分の中身に付いた表示/非表示は、どちらの意味でもないので持たせない。
+ */
+export function createEmptySlot(id: string): LayerGroup {
+  return { id, name: '（空）', visible: true, opacity: 1, children: [], empty: true };
+}
+
+/** 空スロットか（＝「何も無い」を表す中身）。 */
+export function isEmptySlot(node: LayerNode): boolean {
+  return isGroup(node) && node.empty === true;
 }
 
 /** ノード以下の全リーフ(Layer)の id を集める。 */
@@ -85,6 +101,25 @@ export function collectLeafIds(node: LayerNode): string[] {
 export function collectNodeIds(node: LayerNode): string[] {
   if (!isGroup(node)) return [node.id];
   return [node.id, ...node.children.flatMap(collectNodeIds)];
+}
+
+/**
+ * そのノードで「いま実際に絵に出ている」最初のリーフ id（差分スタックは出ている差分だけ辿る）。
+ * 差分を入れ替えたときに描き先を見失わせないための付け替え先。
+ */
+export function shownLeafId(node: LayerNode): string | undefined {
+  if (isVariantStack(node)) {
+    const v = activeVariant(node);
+    return v ? shownLeafId(v) : undefined;
+  }
+  if (isGroup(node)) {
+    for (const c of node.children) {
+      const r = shownLeafId(c);
+      if (r) return r;
+    }
+    return undefined;
+  }
+  return node.id;
 }
 
 /** ノード配列内の最初のリーフ id（active 付け替えのフォールバック用）。 */

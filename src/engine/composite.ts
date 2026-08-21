@@ -1,4 +1,4 @@
-import type { EditorState, ImageBuffer, Layer, LayerNode } from '../types';
+import type { BlendMode, EditorState, ImageBuffer, Layer, LayerNode } from '../types';
 import { createImageBuffer } from './imageBuffer';
 import { isGroup, isVariantStack, resolveSlot } from './layer';
 
@@ -68,15 +68,17 @@ function compositeNodes(out: ImageBuffer, rawNodes: LayerNode[], width: number, 
     // 下地が非表示ならクリップ群ごと出さない（PS 挙動）。
     if (!base.visible || base.opacity <= 0) continue;
     // 下地を透明バッファへ合成し、そのアルファをクリップのマスクに使う。
+    // 透明バッファへの合成ではブレンドモードは効かない（下に何も無い＝normal と同じ）ので、
+    // 下地・クリップそれぞれの合成方法は「出力へ重ねるとき」に一度だけ適用する。
     const baseBuf = createImageBuffer(width, height);
     renderNode(baseBuf, base, width, height);
-    compositeLayer(out, fullCanvasLayer(baseBuf)); // 下地を出力へ
+    compositeLayer(out, fullCanvasLayer(baseBuf, base.blendMode)); // 下地を出力へ
     for (const clip of clips) {
       if (!clip.visible || clip.opacity <= 0) continue;
       const tmp = createImageBuffer(width, height);
       compositeLayer(tmp, clip); // クリップ内容（不透明度込み）を透明バッファへ
       maskAlphaBy(tmp, baseBuf); // 下地アルファでマスク
-      compositeLayer(out, fullCanvasLayer(tmp));
+      compositeLayer(out, fullCanvasLayer(tmp, clip.blendMode));
     }
   }
 }
@@ -110,6 +112,7 @@ function renderNode(out: ImageBuffer, node: LayerNode, width: number, height: nu
       offsetY: 0,
       visible: true,
       opacity: node.opacity,
+      blendMode: node.blendMode, // フォルダの合成結果まるごとを、この方法で下地へ重ねる
     });
   } else {
     compositeLayer(out, node);
@@ -117,8 +120,8 @@ function renderNode(out: ImageBuffer, node: LayerNode, width: number, height: nu
 }
 
 /** フルキャンバス（offset0・不透明度1）の擬似リーフ。合成済みバッファを out へそのまま重ねる用。 */
-function fullCanvasLayer(buffer: ImageBuffer): Layer {
-  return { id: '', name: '', buffer, offsetX: 0, offsetY: 0, visible: true, opacity: 1 };
+function fullCanvasLayer(buffer: ImageBuffer, blendMode?: BlendMode): Layer {
+  return { id: '', name: '', buffer, offsetX: 0, offsetY: 0, visible: true, opacity: 1, blendMode };
 }
 
 /** target のアルファに mask のアルファ（0..1）を掛ける（同一寸法のフルキャンバス前提）。 */
@@ -167,9 +170,18 @@ export function flattenStateRegion(
   return flattenState(shifted, opts);
 }
 
-/** 1レイヤを offset 位置・opacity 込みで out に source-over 合成する。 */
+/**
+ * 1レイヤを offset 位置・opacity 込みで out に合成する（既定は source-over）。
+ *
+ * blendMode='multiply' のときは W3C Compositing の分離可能ブレンドと同じ式で掛け算する:
+ *   Co = αs·(1-αb)·Cs + αs·αb·B(Cb,Cs) + (1-αs)·αb·Cb   （B(Cb,Cs) = Cb·Cs）
+ * これは「ソース色 Cs を Cs' = (1-αb)·Cs + αb·Cb·Cs で置き換えた source-over」と恒等なので、
+ * 下の source-over の式に Cs' を入れるだけで済む（＝normal 経路の演算は一切変えない＝既存ログとビット一致）。
+ * αb=0（下が透明）なら Cs'=Cs で normal に一致し、αb=1 なら Cs'=Cb·Cs で素の乗算になる。
+ */
 export function compositeLayer(out: ImageBuffer, layer: Layer): void {
   const { buffer, opacity } = layer;
+  const multiply = layer.blendMode === 'multiply';
   // オフセットは設計上整数だが、非整数だと宛先インデックスが非整数になり代入が
   // サイレントに無視され、レイヤが消える。防御的に丸めて整数化する。
   const offsetX = Math.round(layer.offsetX);
@@ -184,7 +196,8 @@ export function compositeLayer(out: ImageBuffer, layer: Layer): void {
   // レイヤ不透明度 1（＝素材そのまま）は最頻ケース。ソース画素が完全不透明なら結果は背景に依らず
   // (r,g,b,255) と一致するため、除算・ブレンドを丸ごと省いて直接コピーできる（blendPixel の a>=1
   // 高速パスと同じ理屈でビット一致）。この分岐で不透明レイヤの全画素ブレンドを回避する。
-  const fullyOpaque = opacity === 1;
+  // 乗算では結果が背景色に依存するのでこの近道は使えない（不透明でも掛け算が要る）。
+  const fullyOpaque = opacity === 1 && !multiply;
   // 交差する行/列だけを回す（範囲外の continue を大量に踏まない）。
   const y0 = Math.max(0, -offsetY);
   const y1 = Math.min(bh, oh - offsetY);
@@ -210,6 +223,7 @@ export function compositeLayer(out: ImageBuffer, layer: Layer): void {
       const dstA = od[oi + 3];
       if (dstA === 0) {
         // 背景が完全透明: 結果色 = 素材色そのまま（(sr*sa)/sa = sr）。アルファのみ sa を反映。
+        // 乗算でも αb=0 では Cs'=Cs なので、この近道は両モードで正しい。
         od[oi] = sd[si];
         od[oi + 1] = sd[si + 1];
         od[oi + 2] = sd[si + 2];
@@ -225,12 +239,18 @@ export function compositeLayer(out: ImageBuffer, layer: Layer): void {
         od[oi + 3] = 0;
         continue;
       }
-      const sr = sd[si] / 255;
-      const sg = sd[si + 1] / 255;
-      const sb = sd[si + 2] / 255;
+      let sr = sd[si] / 255;
+      let sg = sd[si + 1] / 255;
+      let sb = sd[si + 2] / 255;
       const dr = od[oi] / 255;
       const dg = od[oi + 1] / 255;
       const db = od[oi + 2] / 255;
+      if (multiply) {
+        // Cs' = (1-αb)·Cs + αb·(Cb·Cs) = Cs·(1 - αb·(1 - Cb))
+        sr *= 1 - da * (1 - dr);
+        sg *= 1 - da * (1 - dg);
+        sb *= 1 - da * (1 - db);
+      }
       od[oi] = Math.round(((sr * sa + dr * da * (1 - sa)) / outA) * 255);
       od[oi + 1] = Math.round(((sg * sa + dg * da * (1 - sa)) / outA) * 255);
       od[oi + 2] = Math.round(((sb * sa + db * da * (1 - sa)) / outA) * 255);

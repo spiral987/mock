@@ -7,6 +7,7 @@ import {
   variantIndexOf,
   activeVariant,
   createVariantStack,
+  createEmptySlot,
   createLayer,
   cloneLayer,
   collectLeafIds,
@@ -52,6 +53,21 @@ function replaceInTree(
   return out;
 }
 
+/**
+ * スロットに入る中身の正規化。
+ *
+ * 横に並ぶ差分は互いに排他なので「今そこに在るか」はスロットの選択だけで決まる。中身に個別の
+ * 表示/非表示フラグが残っていると同じ仕事をする仕掛けが二重になり、
+ *   - 出ていない差分の非表示フラグは誰にも効かない（死んだデータ）
+ *   - スライドして出した瞬間に「出したのに何も無い」になる
+ * という取り違えが起きる。「非表示にして残す」はスロットが置き換える手管理そのものなので、
+ * 中身として入る時点で visible=true に正規化する。行ごと消したいときはスロット側の visible、
+ * 「この状態では出さない」は空スロットへの所属で表す。
+ */
+function asSlotContent(n: LayerNode): LayerNode {
+  return n.visible ? n : { ...n, visible: true };
+}
+
 /** そのスロットに出ている最初のリーフ id（アクティブレイヤーの付け替え先）。 */
 function activeLeafOf(node: LayerNode): string | undefined {
   if (isVariantStack(node)) {
@@ -73,22 +89,30 @@ export interface AddVariantParams {
   name: string;
   /** true なら「いまの差分の複製」を、false なら空レイヤーを新しい差分にする。 */
   copy: boolean;
+  /**
+   * true なら中身のない「空スロット」を足す（＝この行が「何も無い」を選べるようになる）。
+   * copy より優先。省略時は従来どおりなので、古いログはそのまま replay できる。
+   */
+  empty?: boolean;
 }
 
 export const addVariantHandler: OpHandler = {
   type: 'addVariant',
   klass: 'edit',
   apply(state, op) {
-    const { nodeId, stackId, variantId, name, copy } = op.params as unknown as AddVariantParams;
+    const { nodeId, stackId, variantId, name, copy, empty } =
+      op.params as unknown as AddVariantParams;
     if (getNode(state, variantId)) return state; // 冪等
     const node = getNode(state, nodeId);
     if (!node) return state;
 
     // 新しい差分の中身。複製はリーフのみ（フォルダの複製は子孫 id の再採番が要るので対象外）。
-    const makeVariant = (from: LayerNode): Layer =>
-      copy && !isGroup(from)
-        ? { ...cloneLayer(from), id: variantId, name }
-        : createLayer(variantId, name, state.width, state.height);
+    const makeVariant = (from: LayerNode): LayerNode =>
+      empty
+        ? createEmptySlot(variantId)
+        : copy && !isGroup(from)
+          ? { ...cloneLayer(from), id: variantId, name, visible: true }
+          : createLayer(variantId, name, state.width, state.height);
 
     const info = getParentInfo(state, nodeId);
     if (!info) return state;
@@ -107,7 +131,8 @@ export const addVariantHandler: OpHandler = {
         children,
         variantIndex: at + 1,
       }));
-      return { ...state, layers, activeLayerId: variantId };
+      // 空スロットにはリーフが無いので描き先にできない。その場合は描き先を動かさない。
+      return { ...state, layers, activeLayerId: activeLeafOf(variant) ?? state.activeLayerId };
     }
 
     // (a') 対象がスロットそのもの → そのスロットに 1 枚足す（横軸の中に横軸は作らない）。
@@ -122,16 +147,19 @@ export const addVariantHandler: OpHandler = {
         children,
         variantIndex: at + 1,
       }));
-      return { ...state, layers, activeLayerId: variantId };
+      // 空スロットにはリーフが無いので描き先にできない。その場合は描き先を動かさない。
+      return { ...state, layers, activeLayerId: activeLeafOf(variant) ?? state.activeLayerId };
     }
 
     // (b) まだ縦軸だけ → その場でスタックに包み、対象を 1 つ目の差分にして右隣に足す。
     if (getNode(state, stackId)) return state; // id 衝突（冪等側に倒す）
     const variant = makeVariant(node);
     const layers = replaceInTree(state.layers, nodeId, (n) =>
-      createVariantStack(stackId, [n, variant], 1),
+      // 包む対象が非表示だったら、その非表示は「退避のための手管理」だったはず。中身に残さず
+      // スロットの選択へ渡す（asSlotContent のコメント参照）。
+      createVariantStack(stackId, [asSlotContent(n), variant], 1),
     );
-    return { ...state, layers, activeLayerId: variantId };
+    return { ...state, layers, activeLayerId: activeLeafOf(variant) ?? state.activeLayerId };
   },
 
   // 差分追加は統合しない（構造が増える操作）。
@@ -144,12 +172,13 @@ export function createAddVariantOp(
   name: string,
   copy: boolean,
   region?: BBox,
+  empty?: boolean,
 ): Operation {
   return {
     id: genId('addVariant'),
     type: 'addVariant',
     klass: 'edit',
-    params: { nodeId, stackId, variantId, name, copy },
+    params: { nodeId, stackId, variantId, name, copy, ...(empty ? { empty: true } : {}) },
     region: region ?? EMPTY,
     layerId: variantId,
     timestamp: Date.now(),
@@ -196,7 +225,11 @@ export const moveAsVariantHandler: OpHandler = {
 
     // スタックをスタックの隣へ落としたときは、入れ子にせず中身を平らに混ぜる
     // （どちらも「互いに排他な案の集合」なので、合わせて 1 つの集合になるのが自然）。
-    const incoming: LayerNode[] = isVariantStack(node) ? node.children : [node];
+    // 非表示のまま退避されていたレイヤーをスロットへ入れるときは、その非表示を中身に残さない
+    // （＝「非表示にして残す」からスロットへの引っ越し。asSlotContent のコメント参照）。
+    const incoming: LayerNode[] = (
+      isVariantStack(node) ? node.children : [node]
+    ).map(asSlotContent);
     if (incoming.length === 0) return state;
 
     // (a) すでに同じスタックの中に居る同士 → その中での並べ替え（スタックの id を保つ）。
@@ -228,9 +261,31 @@ export const moveAsVariantHandler: OpHandler = {
     const dest = getNode({ ...state, layers }, targetId);
     if (!dest) return state;
 
+    // (b') 落とし先が「スロットの中の 1 枚」＝カルーセルの特定のコマ → その隣へ差し込む。
+    // カルーセルは横軸そのものの絵なので、どのコマの隣に置くかを指して落とせる必要がある。
+    // ここで包んでしまうと横軸の中に横軸ができるため、必ず親スロットへ平らに混ぜる。
+    const destInfo = getParentInfo({ ...state, layers }, targetId);
+    const destParent = destInfo?.parentId ? getNode({ ...state, layers }, destInfo.parentId) : null;
+    if (destParent && isVariantStack(destParent)) {
+      const insert = side === 'right' ? destInfo!.index + 1 : destInfo!.index;
+      const children = [...destParent.children];
+      children.splice(insert, 0, ...incoming);
+      layers = replaceInTree(layers, destParent.id, () => ({
+        ...destParent,
+        children,
+        variantIndex: insert,
+      }));
+      // 落としたものをそのまま表示中の差分にするので、結果が即座に見える。
+      return {
+        ...state,
+        layers,
+        activeLayerId: activeLeafOf(children[insert]) ?? state.activeLayerId,
+      };
+    }
+
     let shown: LayerNode;
     if (isVariantStack(dest)) {
-      // (c) すでに横軸のスロット → いま出ている差分の隣へ差し込む。
+      // (c) スロットそのものへ落とした → いま出ている差分の隣へ差し込む。
       const at = variantIndexOf(dest);
       const insert = side === 'right' ? at + 1 : at;
       const children = [...dest.children];
@@ -240,7 +295,8 @@ export const moveAsVariantHandler: OpHandler = {
     } else {
       // (d) まだ縦軸だけ → その場で横軸化し、落とした側を表示中の差分にする。
       if (getNode({ ...state, layers }, stackId)) return state; // id 衝突（冪等側へ倒す）
-      const children = side === 'right' ? [dest, ...incoming] : [...incoming, dest];
+      const base = asSlotContent(dest); // 落とし先も中身になるので同じ正規化を通す
+      const children = side === 'right' ? [base, ...incoming] : [...incoming, base];
       const index = side === 'right' ? 1 : 0;
       layers = replaceInTree(layers, targetId, () => createVariantStack(stackId, children, index));
       shown = children[index];
@@ -288,9 +344,11 @@ export const setVariantIndexHandler: OpHandler = {
     const updated: LayerGroup = { ...stack, variantIndex: next };
     const layers = replaceInTree(state.layers, stackId, () => updated);
     // 描いていた差分が引っ込んだら、いま出てきた差分を描画対象にする（描き先を見失わせない）。
+    // 出てきたのが空スロットならリーフが無いので、木のどこか（最背面）へ逃がす
+    // ＝合成に出ていないレイヤーが描き先のまま残って「描いても何も出ない」になるのを避ける。
     let activeLayerId = state.activeLayerId;
     if (collectLeafIds(stack).includes(activeLayerId)) {
-      activeLayerId = activeLeafOf(updated) ?? activeLayerId;
+      activeLayerId = activeLeafOf(updated) ?? firstLeafId(layers) ?? activeLayerId;
     }
     return { ...state, layers, activeLayerId };
   },

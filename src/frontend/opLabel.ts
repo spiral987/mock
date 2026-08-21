@@ -24,6 +24,10 @@ export function describeOp(op: Operation): string {
       return p.visible ? 'show' : 'hide';
     case 'setLayerOpacity':
       return `opacity ${Math.round((p.opacity as number) * 100)}%`;
+    case 'setLayerClipping':
+      return p.clipped ? 'clip' : 'unclip';
+    case 'setLayerBlendMode':
+      return p.blendMode === 'multiply' ? '乗算' : '通常';
     case 'renameLayer':
       return `→ "${p.name}"`;
     case 'removeLayer':
@@ -38,16 +42,24 @@ export function describeOp(op: Operation): string {
       return p.wrapLayerId ? `folder "${p.name}" (wrap)` : `folder "${p.name}"`;
     case 'moveNode':
       return p.parentId ? `→ into ${p.parentId}` : '→ top';
-    case 'setGroupCollapsed':
-      return p.collapsed ? 'collapse' : 'expand';
     case 'addVariant':
-      return `${p.copy ? 'copy' : 'new'} variant "${p.name}"`;
+      return p.empty ? '空スロットを足す' : `${p.copy ? 'copy' : 'new'} variant "${p.name}"`;
     case 'setVariantIndex':
       return `slide → ${(p.index as number) + 1}`;
     case 'removeVariant':
       return 'remove variant';
     case 'moveAsVariant':
       return `${p.side === 'left' ? '←' : '→'} ${p.targetId} の差分へ`;
+    case 'addState':
+      return `状態 "${p.name}"`;
+    case 'removeState':
+      return '状態を削除（所属が一斉に外れる）';
+    case 'renameState':
+      return `→ "${p.name}"`;
+    case 'setAttachment':
+      return p.slotId === null ? `所属を外す (${p.stackId})` : `所属 → ${p.slotId}`;
+    case 'applyState':
+      return '状態を出す';
     case 'fill':
       return p.erase
         ? `透明 tol${p.tolerance}`

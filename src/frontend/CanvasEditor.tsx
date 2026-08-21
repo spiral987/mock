@@ -1,5 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import type {
+  CSSProperties,
   MutableRefObject,
   PointerEvent as ReactPointerEvent,
   MouseEvent as ReactMouseEvent,
@@ -14,6 +22,7 @@ import type {
   Operation,
   SelectionMask,
   StrokePoint,
+  VariantState,
 } from '../types';
 import type { EditorSession } from '../session';
 import { statesEqual } from '../engine/compare';
@@ -30,6 +39,7 @@ import {
   createSetLayerVisibilityOp,
   createSetLayerOpacityOp,
   createSetLayerClippingOp,
+  createSetLayerBlendModeOp,
   createRenameLayerOp,
   createRemoveLayerOp,
   createReorderLayerOp,
@@ -37,7 +47,6 @@ import {
   createMergeDownLayerOp,
   createMoveNodeOp,
   createAddGroupOp,
-  createSetGroupCollapsedOp,
   createFillOp,
   fillRegion,
   createTransformOp,
@@ -49,8 +58,22 @@ import {
   createLassoFillOp,
   createSetSelectionOp,
   createClearSelectionOp,
+  createAddStateOp,
+  createRemoveStateOp,
+  createRenameStateOp,
+  createSetAttachmentOp,
+  createApplyStateOp,
   type TransformParams,
 } from '../engine/operations';
+import {
+  listStates,
+  liveAttachment,
+  liveAttachmentsOf,
+  stateSatisfied,
+  railCell,
+  attachTarget,
+  type RailCell,
+} from '../engine/variantState';
 import {
   selectionArea,
   selectionBounds,
@@ -65,6 +88,7 @@ import {
   collectLeafIds,
   collectNodeIds,
   isVariantStack,
+  isEmptySlot,
   activeVariant,
   variantIndexOf,
 } from '../engine/layer';
@@ -133,17 +157,53 @@ const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
   {
     label: '描く',
     tools: [
-      { id: 'brush', label: 'ブラシ', key: 'B', icon: 'brush', hint: '素直な丸筆' },
-      { id: 'gpen', label: 'Gペン', key: 'N', icon: 'gpen', hint: '入り抜きの効く硬いペン' },
-      { id: 'pencil', label: '鉛筆', key: 'P', icon: 'pencil', hint: '紙目の残る鉛筆' },
-      { id: 'airbrush', label: 'エアブラシ', key: 'A', icon: 'airbrush', hint: '重ねて濃くする霧' },
+      {
+        id: 'brush',
+        label: 'ブラシ',
+        key: 'B',
+        icon: 'brush',
+        hint: '素直な丸筆',
+      },
+      {
+        id: 'gpen',
+        label: 'Gペン',
+        key: 'N',
+        icon: 'gpen',
+        hint: '入り抜きの効く硬いペン',
+      },
+      {
+        id: 'pencil',
+        label: '鉛筆',
+        key: 'P',
+        icon: 'pencil',
+        hint: '紙目の残る鉛筆',
+      },
+      {
+        id: 'airbrush',
+        label: 'エアブラシ',
+        key: 'A',
+        icon: 'airbrush',
+        hint: '重ねて濃くする霧',
+      },
     ],
   },
   {
     label: '消す・塗る',
     tools: [
-      { id: 'eraser', label: '消しゴム', key: 'E', icon: 'eraser', hint: 'アクティブレイヤーを消す' },
-      { id: 'bucket', label: '塗りつぶし', key: 'G', icon: 'bucket', hint: '同じ色の連結領域を塗る' },
+      {
+        id: 'eraser',
+        label: '消しゴム',
+        key: 'E',
+        icon: 'eraser',
+        hint: 'アクティブレイヤーを消す',
+      },
+      {
+        id: 'bucket',
+        label: '塗りつぶし',
+        key: 'G',
+        icon: 'bucket',
+        hint: '同じ色の連結領域を塗る',
+      },
       {
         id: 'lassoFill',
         label: '投げ縄塗り',
@@ -151,14 +211,32 @@ const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
         icon: 'lassoFill',
         hint: '囲った内側をそのまま塗る（線が閉じていなくてよい）',
       },
-      { id: 'eyedropper', label: 'スポイト', key: 'I', icon: 'eyedropper', hint: '画面の色を拾う' },
+      {
+        id: 'eyedropper',
+        label: 'スポイト',
+        key: 'I',
+        icon: 'eyedropper',
+        hint: '画面の色を拾う',
+      },
     ],
   },
   {
     label: '図形',
     tools: [
-      { id: 'line', label: '直線', key: 'L', icon: 'line', hint: 'ドラッグで直線' },
-      { id: 'rect', label: '矩形', key: 'R', icon: 'rect', hint: 'ドラッグで長方形の外周' },
+      {
+        id: 'line',
+        label: '直線',
+        key: 'L',
+        icon: 'line',
+        hint: 'ドラッグで直線',
+      },
+      {
+        id: 'rect',
+        label: '矩形',
+        key: 'R',
+        icon: 'rect',
+        hint: 'ドラッグで長方形の外周',
+      },
     ],
   },
   {
@@ -171,7 +249,13 @@ const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
         icon: 'lassoSelect',
         hint: '囲った内側だけ描けるようにする（Shift=追加 / Alt=削除 / Shift+Alt=交差）',
       },
-      { id: 'transform', label: '変形', key: 'V', icon: 'transform', hint: '移動・拡大縮小・回転' },
+      {
+        id: 'transform',
+        label: '変形',
+        key: 'V',
+        icon: 'transform',
+        hint: '移動・拡大縮小・回転',
+      },
       {
         id: 'inspect',
         label: '履歴しらべ',
@@ -187,7 +271,6 @@ const TOOLS: ToolDef[] = TOOL_GROUPS.flatMap((g) => g.tools);
 
 /** 投げ縄の点列を間引くしきい値(px)。これ未満しか動いていない点は捨てる（多角形の辺を減らす）。 */
 const LASSO_MIN_STEP = 1.5;
-
 
 /**
  * 描画色の枠。'transparent' は色ではなく「アルファを削る」指定で、
@@ -206,8 +289,9 @@ type DropPos = 'above' | 'below' | 'into' | 'left' | 'right';
 const SIZE_DRAG_FACTOR = 0.5;
 
 // レイヤー行サムネイルの表示サイズ(px)。生成は高DPIで滲まないよう2倍解像度で焼く。
-const LAYER_THUMB_W = 34;
-const LAYER_THUMB_H = 26;
+// CSS の .layer-thumb と一致させること（行の高さはほぼこの値で決まる）。
+const LAYER_THUMB_W = 48;
+const LAYER_THUMB_H = 36;
 
 // レイヤー行のジェスチャ開始しきい値(px)。これ未満の移動はクリック（選択/リネーム/ボタン）として扱う。
 const LAYER_GESTURE_THRESHOLD = 4;
@@ -232,8 +316,39 @@ const VARIANT_DROP_DX = 40;
 
 // カルーセルのサムネイル 1 枚ぶんの間隔(px)。＝スライドで 1 段ずらすのに必要な距離でもある
 // （指の移動量とサムネイルの移動量が 1:1 になるので、どこまで動かせば隣かが目で分かる）。
-// CSS の .vc-chip の幅 + gap と一致させること。
-const VARIANT_PITCH_PX = 40;
+// CSS の .vc-chip の幅 + gap と一致させること（= LAYER_THUMB_W + 6）。
+const VARIANT_PITCH_PX = 54;
+
+// 行そのものを扱う場所（掴む・開閉する・名前を読む/変える）。
+// ここにカーソルが乗っている間は横軸の帯を出さない。
+//
+// 帯は行に重なるので、出ている間はその下の物を押せない。差分にしたフォルダは
+// 開閉の ▾ が帯に隠れて【開く手段が無くなっていた】。帯は行の中央（サムネイル）を中心に
+// 開くようにして ⠿ / ▾ には届かせず、さらにここに挙げた場所からは帯を呼ばないことで、
+// 「行そのものを触りに来た手」と「横軸を見に来た手」を分ける。
+//
+// サムネイル（.layer-axis の中）は含めない。そこは横軸そのものの絵＝帯の取っ手で、
+// 帯はその 1 枚を動かさずに左右へ広がるだけなので、覆って困るものが無い。
+const ROW_OWN_PARTS = '.layer-grip, .icon-btn, .layer-name, .layer-name-input';
+
+// ---- 状態のレール（行の左を縦に走る線）の寸法 --------------------------------
+// 状態ごとに 1 本の縦線をリストの左に立て、行との交点に印を打つ。点と点を総当たりで
+// 結ぶ（メッシュ）のではなく 1 本に束ねるのは、(1) 状態そのものを押せる対象にできる、
+// (2)「所属していない」が線の途切れとして見える、(3) 線が交差しない、の 3 点のため。
+const RAIL_PITCH = 16; // レール間隔(px)
+const RAIL_PAD_L = 9; // 一番左のレールまでの余白(px)
+const RAIL_PAD_R = 7; // 最後のレールと行の間の余白(px)
+const RAIL_KNOB_R = 4.5; // スロット行の印（丸）の半径(px)
+const RAIL_DOT_R = 2.6; // 開いたスロットの中の 1 枚に打つ点の半径(px)
+// 区間の上下に足す延長(px)。1 区間は「最初の行の上端〜最後の行の下端」を 1 本で引くので
+// 区間の中では継ぎ目が出ない。この延長は端を行の枠（.layer-item の縦 padding）まで届かせるための分で、
+// 途切れ（＝所属していない行）は行の高さぶんそのまま空くので、延ばしても潰れない。
+const RAIL_BRIDGE = 7;
+
+// レールの色。状態の名札(swatch)と同じ色を使い、「どのレールがどの状態か」を
+// 位置ではなく色で対応させる（名前の幅はレール間隔に収まらないため）。
+const RAIL_COLORS = ['#7ec7a8', '#e0a75e', '#b28fe0', '#5b9dff', '#e07a7a', '#8fd0e0'];
+const railColor = (i: number) => RAIL_COLORS[i % RAIL_COLORS.length];
 
 // キャンバス1辺の上限（画素）。ブラウザの canvas 制限（Chrome ~16384/辺）に合わせた安全上限。
 // 実際には総面積・メモリ（1レイヤ = w*h*4 byte）が先に効くので、大きい値は自己責任で。
@@ -251,7 +366,14 @@ const CANVAS_PRESETS: { label: string; w: number; h: number }[] = [
 // ---- Transform ツール（移動・拡大縮小・回転を1ツールに統合） ----
 // 1ドラッグ = 1操作。move は非破壊の translate、scale/rotate は transform（resample）として確定する。
 type XformGesture =
-  | { mode: 'move'; startX: number; startY: number; bbox: BBox; dx: number; dy: number }
+  | {
+      mode: 'move';
+      startX: number;
+      startY: number;
+      bbox: BBox;
+      dx: number;
+      dy: number;
+    }
   | {
       mode: 'scale';
       corner: { x: number; y: number }; // 掴んだ頂点（ジェスチャ開始時）
@@ -335,6 +457,7 @@ function LayerOpButton({
   onClick,
   disabled,
   on,
+  tone,
 }: {
   icon: ToolIconName;
   label: string;
@@ -343,10 +466,15 @@ function LayerOpButton({
   disabled?: boolean;
   /** 押しっぱなしに見せる（クリッピングが効いている間など）。 */
   on?: boolean;
+  /**
+   * 点いているときの色。効いている状態が複数あるので、同じ色で並べると何が有効なのか読めない。
+   * 行に出す印（非 / 乗 / ⤵）と同じ色に揃えて、上と下で対応が取れるようにする。
+   */
+  tone?: 'off' | 'mul' | 'clip';
 }) {
   return (
     <button
-      className={`layer-op${on ? ' on' : ''}`}
+      className={`layer-op${on ? ' on' : ''}${tone ? ` tone-${tone}` : ''}`}
       title={title}
       onClick={onClick}
       disabled={disabled}
@@ -400,7 +528,12 @@ export function CanvasEditor({
   const imageInputRef = useRef<HTMLInputElement>(null);
   const psdInputRef = useRef<HTMLInputElement>(null);
   // 中ボタン/Space ドラッグによるパン中の状態。
-  const panningRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const panningRef = useRef<{
+    x: number;
+    y: number;
+    left: number;
+    top: number;
+  } | null>(null);
   // pan ジェスチャ実行中フラグ。true の間は panRef を state から上書きせず（命令的更新を正とする）、
   // ジェスチャ終了時に一度だけ setPan で React state へ確定する。
   const panGestureRef = useRef(false);
@@ -415,7 +548,10 @@ export function CanvasEditor({
   // 連続する変形ジェスチャの統合用。直前に確定した変形 op の id と、元バッファからの累積行列。
   // 同一ストリークが続く限り元バッファから1回だけ再サンプルし直すことで、回転の反復による
   // バッファ肥大・再サンプル累積（解像度低下）を防ぐ。
-  const xformStreakRef = useRef<{ opId: string; cumulative: TransformParams } | null>(null);
+  const xformStreakRef = useRef<{
+    opId: string;
+    cumulative: TransformParams;
+  } | null>(null);
   // ストリーク開始時（最初の変形 op を適用する直前）の状態。継続ジェスチャは全ログ replay せず
   // applyOperation(baseState, op) で元バッファから1回だけ再サンプルし直す（確定の重さ対策）。
   const xformBaseStateRef = useRef<EditorState | null>(null);
@@ -423,21 +559,29 @@ export function CanvasEditor({
   const shapeRef = useRef<{ startX: number; startY: number } | null>(null);
   // 投げ縄（選択 / 塗り）のドラッグ中。点列はキャンバス座標の平坦配列 [x0,y0,x1,y1,...]。
   // 離した時点で 1 op（setSelection / lassoFill）として確定する = Undo 1 回で元に戻る。
-  const lassoRef = useRef<{ pts: number[]; kind: 'select' | 'fill'; mode: SelectionMode } | null>(
-    null,
-  );
+  const lassoRef = useRef<{
+    pts: number[];
+    kind: 'select' | 'fill';
+    mode: SelectionMode;
+  } | null>(null);
   // 選択範囲・投げ縄ドラッグを描く重ね canvas（絵の canvas を汚さないので、点線を動かしても再合成が要らない）。
   const selCanvasRef = useRef<HTMLCanvasElement>(null);
   // マーチングアンツ（動く点線）の位相。
   const antsPhaseRef = useRef(0);
   // 選択マスク → 輪郭ループのキャッシュ（マスクの参照が変わったときだけ再計算する）。
-  const outlineCacheRef = useRef<{ sel: SelectionMask | null; loops: number[][] } | null>(null);
+  const outlineCacheRef = useRef<{
+    sel: SelectionMask | null;
+    loops: number[][];
+  } | null>(null);
   // S キー押下中の「太さ調整モード」での上下ドラッグ（押下時の clientY と太さを控える）。
   const sizeDragRef = useRef<{ startY: number; startSize: number } | null>(null);
   // Z キー押下中の「ズームモード」での上下ドラッグ（押下時の clientY・倍率・カーソル位置を控える）。
-  const zoomDragRef = useRef<{ startY: number; startZoom: number; anchorX: number; anchorY: number } | null>(
-    null,
-  );
+  const zoomDragRef = useRef<{
+    startY: number;
+    startZoom: number;
+    anchorX: number;
+    anchorY: number;
+  } | null>(null);
   // レイヤーパネルの D&D 並べ替えでドラッグ中のノード id。
   const dragIdRef = useRef<string | null>(null);
   // ドラッグを掴んだ位置（クライアント座標）。ここからの横移動量で「縦に積む／横に並べる」を分ける。
@@ -449,11 +593,24 @@ export function CanvasEditor({
     startX: number;
     startY: number;
     pointerId: number;
-    /** 長押しの計測対象の行要素（タイマー発火時に pointer を捕捉するため控える）。 */
+    /** 長押しの計測対象の要素（タイマー発火時に pointer を捕捉するため控える）。 */
     el: HTMLElement;
+    /**
+     * 何を掴んでいるか。動かしたときの意味が違う:
+     *   'row'  … 行を掴んだ。横に動かせば差分のスライド、押したままなら持ち上げ
+     *   'chip' … カルーセルのコマを掴んだ。動かせばそのコマの持ち上げ（並べ替え／取り出し）
+     */
+    kind: 'row' | 'chip';
   } | null>(null);
   // 長押しで持ち上がるまでのタイマー。動き出す／離す／スライドに入ると取り消す。
   const liftTimerRef = useRef<number | null>(null);
+  // 直前のジェスチャ（差分の左右スライド / 持ち上げての移動）がこのポインタ操作を使い切ったか。
+  //
+  // 行は「クリックで選ぶ」ようになっているが、pointer capture 中の click は掴んだ行へ飛んでくるので、
+  // スライドや移動のあとにも click が 1 発届く。それを選択として処理すると、click ハンドラが握って
+  // いるのは【スライド前】に出ていた差分なので、切り替えたばかりの差分をその場で元へ戻してしまう。
+  // ジェスチャを完了した時に立て、次の pointerdown で落とす。
+  const gestureConsumedRef = useRef(false);
   // 差分の左右スライド中（持ち上げる前に横へ動かしたとき）。
   const swipeRef = useRef<{
     stackId: string;
@@ -488,9 +645,10 @@ export function CanvasEditor({
   const inkSlotRef = useRef<'main' | 'sub'>('main');
   if (colorSlot !== 'transparent') inkSlotRef.current = colorSlot;
   /** いま描く色。透明を選んでいる間も「戻る先の色」を指す（カーソル表示やピッカーの対象）。 */
-  const color = (colorSlot === 'sub' || (colorSlot === 'transparent' && inkSlotRef.current === 'sub'))
-    ? subColor
-    : mainColor;
+  const color =
+    colorSlot === 'sub' || (colorSlot === 'transparent' && inkSlotRef.current === 'sub')
+      ? subColor
+      : mainColor;
   const transparentInk = colorSlot === 'transparent';
   /** この一筆はアルファを削るか（消しゴムツール、または透明色を選んでいるとき）。 */
   const erasing = transparentInk || tool === 'eraser';
@@ -523,13 +681,36 @@ export function CanvasEditor({
   const [opacity, setOpacity] = useState(1);
   const [tolerance, setTolerance] = useState(24);
   const [activeLayerId, setActiveLayerId] = useState(session.state.activeLayerId);
-  // 差分を「覗き見」している状態。state は変えず、いまどの差分が出るかだけを差し替える
-  // （離す/クリックで初めて 1 op として確定＝見比べても履歴が汚れない）。
-  const [variantPeek, setVariantPeek] = useState<{ stackId: string; index: number } | null>(null);
-  const variantPeekRef = useRef<{ stackId: string; index: number; baseIndex: number } | null>(null);
-  // 左右スライド中のスロット（カルーセルを出す対象）。
+  // レイヤー操作ボタンの対象（＝いま選んでいる行）。
+  //
+  // 行の中にボタンを置かず、操作は全部パネル上部のボタン群へ集約している（行は掴む・眺める場所に
+  // しておきたいので、押せる小物を並べない）。そのぶん「どの行に効くのか」を state で持つ必要がある。
+  // 描き先(activeLayerId)と分けているのは、描き先は必ずリーフである一方、操作の対象はフォルダや
+  // スロットにもなる（フォルダごと乗算、フォルダごと削除）から。リーフを選べば両方が一緒に動く。
+  const [selectedId, setSelectedId] = useState(session.state.activeLayerId);
+  // 左右スライド中に、まだ確定していない差分を仮に出している状態。state は変えず、いまどの差分が
+  // 出るかだけを差し替える（指を離した時点で初めて 1 op として確定＝スライドしても履歴が汚れない）。
+  // 指を動かしている間だけの表示で、乗せただけでは立たない（peekVariant のコメント参照）。
+  const [variantPeek, setVariantPeek] = useState<{
+    stackId: string;
+    index: number;
+  } | null>(null);
+  const variantPeekRef = useRef<{
+    stackId: string;
+    index: number;
+    baseIndex: number;
+  } | null>(null);
+  // 左右スライド中のスロット（差分の帯を出す対象）。
   const [swipingStackId, setSwipingStackId] = useState<string | null>(null);
-  // カルーセルの帯。指の動きに毎フレーム追従させるので、再レンダーを挟まず transform を直接書く。
+  /**
+   * カーソルが乗っているスロット行。ここにカルーセル（横軸そのものの絵）を出す。
+   *
+   * 以前は左右スライド中だけ出していたが、縦一覧を廃止したので横軸を見る手段はカルーセルだけになった。
+   * 常に出すと行が高くなりすぎるので、乗せたときに出す。ドラッグ中は「どのコマの隣へ落とすか」を
+   * 選ばせる必要があるので、持ち上げたまま乗ってきた行でも開く。
+   */
+  const [hoverStackId, setHoverStackId] = useState<string | null>(null);
+  // 差分の帯。指の動きに毎フレーム追従させるので、再レンダーを挟まず transform を直接書く。
   const carouselTrackRef = useRef<HTMLDivElement>(null);
   const [histIndex, setHistIndex] = useState<number | null>(null);
   const [verify, setVerify] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -538,13 +719,29 @@ export function CanvasEditor({
   // パン(視点移動)は scroll ではなく transform で行う（キャンバスが画面に収まっていても動かせる）。
   // pan = キャンバス左上のビューポート左上からのオフセット(px)。
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [opacityDraft, setOpacityDraft] = useState<{ id: string; v: number } | null>(null);
+  const [opacityDraft, setOpacityDraft] = useState<{
+    id: string;
+    v: number;
+  } | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
+  // フォルダ／スロットの開閉。既定（フォルダ=開く / スロット=畳む）からひっくり返したものだけを覚える。
+  // log にも undo にも載せない純粋な見た目の状態（toggleCollapse のコメント参照）。
+  const [collapseOverride, setCollapseOverride] = useState<Map<string, boolean>>(new Map());
+  // 状態の名札を書き換え中（ダブルクリックで入る）。
+  const [editingStateId, setEditingStateId] = useState<string | null>(null);
+  const [editingStateName, setEditingStateName] = useState('');
+  // レール描画のために測った行の位置。木の入れ子（＝行ごとに左端の x が違う）に依存せず
+  // 線を引きたいので、CSS で段組みするのではなく実測して SVG に描く。
+  const layerTreeRef = useRef<HTMLDivElement | null>(null);
+  const [railRows, setRailRows] = useState<{ id: string; y: number; h: number }[]>([]);
   // レイヤー D&D 中のドロップ位置ヒント（対象ノード id と、その上/下/中/左/右への挿入）。
   const [dropHint, setDropHint] = useState<{ id: string; pos: DropPos } | null>(null);
   // 持ち上げ中の行（null = 掴んでいない）。ゴーストの表示と、持ち上がった行の見た目に使う。
-  const [dragGhost, setDragGhost] = useState<{ id: string; name: string } | null>(null);
+  const [dragGhost, setDragGhost] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
   // キャンバスサイズ入力の下書き（Apply で確定）。remount 時に現在サイズで初期化される。
   const [wDraft, setWDraft] = useState(String(width));
   const [hDraft, setHDraft] = useState(String(height));
@@ -578,9 +775,15 @@ export function CanvasEditor({
   const eraserTexture = (): { brushType?: BrushType; brush?: BrushSettings } =>
     tool === 'eraser' ? {} : { brushType, brush: brushSet };
   const setBrushField = (key: keyof BrushSettings, v: number) =>
-    setBrushTuning((prev) => ({ ...prev, [brushType]: { ...prev[brushType], [key]: v } }));
+    setBrushTuning((prev) => ({
+      ...prev,
+      [brushType]: { ...prev[brushType], [key]: v },
+    }));
   const resetBrushTuning = () =>
-    setBrushTuning((prev) => ({ ...prev, [brushType]: { ...BRUSH_DEFAULTS[brushType] } }));
+    setBrushTuning((prev) => ({
+      ...prev,
+      [brushType]: { ...BRUSH_DEFAULTS[brushType] },
+    }));
   // スポイトから戻る先。直前に使っていた筆を覚えておく（既定はブラシ）。
   const lastPaintToolRef = useRef<Tool>('brush');
   if (isPaintTool(tool)) lastPaintToolRef.current = tool;
@@ -620,8 +823,8 @@ export function CanvasEditor({
     let st = session.state;
     const pv = opacityPreviewRef.current;
     if (pv) st = updateNode(st, pv.layerId, (n) => ({ ...n, opacity: pv.opacity }));
-    // 差分サムネイルを覗き見中は、まだ確定していない差分を仮に出して見せる
-    // （クリックで初めて 1 op として確定する）。
+    // 差分を左右スライド中は、中央の枠に来ている（まだ確定していない）差分を仮に出して見せる
+    // （指を離した時点で初めて 1 op として確定する）。
     const vp = variantPeekRef.current;
     if (vp && vp.index !== vp.baseIndex) {
       st = updateNode(st, vp.stackId, (n) => (isGroup(n) ? { ...n, variantIndex: vp.index } : n));
@@ -643,7 +846,11 @@ export function CanvasEditor({
   // 選択範囲の要約（パネル表示用）。面積の算出はマスク全走査なので、version ではなく
   // 「マスクの参照」を依存にする（描くたびに数百万画素を数え直さないため。選択を変えた時だけ走る）。
   const selectionMask = session.state.selection ?? null;
-  const selectionInfo = useMemo<{ w: number; h: number; area: number } | null>(() => {
+  const selectionInfo = useMemo<{
+    w: number;
+    h: number;
+    area: number;
+  } | null>(() => {
     if (!selectionMask) return null;
     const b = selectionBounds(selectionMask);
     return { w: b.w, h: b.h, area: selectionArea(selectionMask) };
@@ -696,7 +903,8 @@ export function CanvasEditor({
     if (rw <= 0 || rh <= 0) {
       // アートボード内に可視の変化なし。overlay だけ描き直す。
       drawHighlight(c);
-      if (tool === 'transform' && activeContentBBox) drawXformBox(c, bboxCorners(activeContentBBox));
+      if (tool === 'transform' && activeContentBBox)
+        drawXformBox(c, bboxCorners(activeContentBBox));
       return;
     }
     // 領域が広いと windowing のオーバーヘッドが勝るので素直に全面。
@@ -739,11 +947,14 @@ export function CanvasEditor({
       flushDirtyRepaint();
     }, 90);
   };
-  useEffect(() => () => {
-    if (exactTimerRef.current !== null) clearTimeout(exactTimerRef.current);
-    if (wheelPanTimerRef.current !== null) clearTimeout(wheelPanTimerRef.current);
-    if (liftTimerRef.current !== null) clearTimeout(liftTimerRef.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (exactTimerRef.current !== null) clearTimeout(exactTimerRef.current);
+      if (wheelPanTimerRef.current !== null) clearTimeout(wheelPanTimerRef.current);
+      if (liftTimerRef.current !== null) clearTimeout(liftTimerRef.current);
+    },
+    [],
+  );
 
   // 新しいドキュメント（別 session）になったときだけ Replayer を作り直す。session.width/height は
   // その doc の元サイズで不変なので、リサイズ（canvasSize op）では作り直さない。
@@ -782,9 +993,13 @@ export function CanvasEditor({
   }, [tool, activeLayerId]);
 
   // checkout 等でアクティブレイヤが存在しなくなったら現在状態の active に合わせる。
+  // 選択（操作ボタンの対象）も消えていたら描き先へ寄せる（押した先が無いボタンを残さない）。
   useEffect(() => {
     if (!getNode(session.state, activeLayerId)) {
       setActiveLayerId(session.state.activeLayerId);
+    }
+    if (!getNode(session.state, selectedId)) {
+      setSelectedId(session.state.activeLayerId);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [version]);
@@ -839,26 +1054,79 @@ export function CanvasEditor({
     }
     if (meta) return; // 他の Ctrl/Cmd 系はブラウザに委ねる
     switch (e.key) {
-      case 'b': case 'B': setTool('brush'); break;
-      case 'n': case 'N': setTool('gpen'); break;
-      case 'p': case 'P': setTool('pencil'); break;
-      case 'a': case 'A': setTool('airbrush'); break;
-      case 'e': case 'E': setTool('eraser'); break;
-      case 'g': case 'G': setTool('bucket'); break;
-      case 'u': case 'U': setTool('lassoFill'); break;
-      case 'i': case 'I': setTool('eyedropper'); break;
-      case 'l': case 'L': setTool('line'); break;
-      case 'r': case 'R': setTool('rect'); break;
-      case 'm': case 'M': setTool('lassoSelect'); break;
-      case 'v': case 'V': setTool('transform'); break;
-      case 'q': case 'Q': setTool('inspect'); break;
-      case 'x': case 'X': toggleMainSub(); break;
-      case 'c': case 'C': toggleTransparent(); break;
+      case 'b':
+      case 'B':
+        setTool('brush');
+        break;
+      case 'n':
+      case 'N':
+        setTool('gpen');
+        break;
+      case 'p':
+      case 'P':
+        setTool('pencil');
+        break;
+      case 'a':
+      case 'A':
+        setTool('airbrush');
+        break;
+      case 'e':
+      case 'E':
+        setTool('eraser');
+        break;
+      case 'g':
+      case 'G':
+        setTool('bucket');
+        break;
+      case 'u':
+      case 'U':
+        setTool('lassoFill');
+        break;
+      case 'i':
+      case 'I':
+        setTool('eyedropper');
+        break;
+      case 'l':
+      case 'L':
+        setTool('line');
+        break;
+      case 'r':
+      case 'R':
+        setTool('rect');
+        break;
+      case 'm':
+      case 'M':
+        setTool('lassoSelect');
+        break;
+      case 'v':
+      case 'V':
+        setTool('transform');
+        break;
+      case 'q':
+      case 'Q':
+        setTool('inspect');
+        break;
+      case 'x':
+      case 'X':
+        toggleMainSub();
+        break;
+      case 'c':
+      case 'C':
+        toggleTransparent();
+        break;
       // いま描いているレイヤーが属するスロットの差分を往復する（A/B をパタパタ見比べる）。
-      case ',': stepActiveVariant(-1); break;
-      case '.': stepActiveVariant(1); break;
-      case '[': setSize((s) => Math.max(1, s - 2)); break;
-      case ']': setSize((s) => Math.min(80, s + 2)); break;
+      case ',':
+        stepActiveVariant(-1);
+        break;
+      case '.':
+        stepActiveVariant(1);
+        break;
+      case '[':
+        setSize((s) => Math.max(1, s - 2));
+        break;
+      case ']':
+        setSize((s) => Math.min(80, s + 2));
+        break;
     }
   };
 
@@ -1016,6 +1284,48 @@ export function CanvasEditor({
     centerView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
+
+  /**
+   * レイヤー行の位置を実測して、状態のレールを引くための座標を取る。
+   *
+   * CSS の段組みで左に列を作る手も考えたが、行の左端の x は入れ子の深さで変わる（フォルダの
+   * padding とネスト枠のぶんずつ右へ寄る）ので、行の中に置いた印は深さごとにずれて
+   * 「1 本の線」に見えなくなる。実測して 1 枚の SVG に描けば入れ子と無関係に真っ直ぐ引ける。
+   *
+   * 依存配列を置かず毎レンダー後に測り、値が変わらなければ setState しない（＝再レンダーの輪を作らない）。
+   */
+  const measureRails = useCallback(() => {
+    const root = layerTreeRef.current;
+    if (!root) return;
+    const base = root.getBoundingClientRect().top;
+    const rows: { id: string; y: number; h: number }[] = [];
+    // querySelectorAll は文書順＝画面の上から下の順で返るので、そのままレールの走る順になる。
+    root.querySelectorAll<HTMLElement>('.layer-head[data-id]').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      rows.push({ id: el.dataset.id ?? '', y: r.top - base, h: r.height });
+    });
+    setRailRows((prev) => {
+      const same =
+        prev.length === rows.length &&
+        prev.every((p, i) => p.id === rows[i].id && p.y === rows[i].y && p.h === rows[i].h);
+      return same ? prev : rows; // 変わっていなければ setState しない＝再レンダーの輪を作らない
+    });
+  }, []);
+
+  // 毎レンダー後に測る（依存配列を置かない）。行の増減・開閉・リネームで位置が動くので、
+  // 「何が変わったら測り直すか」を列挙するより、測って同じなら何もしない方が確実。
+  useLayoutEffect(() => {
+    measureRails();
+  });
+
+  // ウインドウを縮めた／行が伸びた等、レンダーを伴わない高さ変化にも追従する。
+  useEffect(() => {
+    const root = layerTreeRef.current;
+    if (!root) return;
+    const ro = new ResizeObserver(() => measureRails());
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [measureRails]);
 
   // リサイズで現在サイズが変わったら数値入力欄も追従させる（入力中の値は width が変わらない限り保持）。
   useEffect(() => {
@@ -1393,7 +1703,10 @@ export function CanvasEditor({
     xformPreviewRef.current = {
       below: rasterizeBuffer(flattenState({ ...session.state, layers: layers.slice(0, k) })),
       above: rasterizeBuffer(
-        flattenState({ ...session.state, layers: layers.slice(k + 1) }, { background: [0, 0, 0, 0] }),
+        flattenState(
+          { ...session.state, layers: layers.slice(k + 1) },
+          { background: [0, 0, 0, 0] },
+        ),
       ),
       active: rasterizeBuffer(node.buffer),
       offsetX: node.offsetX,
@@ -1454,7 +1767,10 @@ export function CanvasEditor({
     }
     compositeToCanvas(
       c,
-      applyOperation(session.state, createTransformOp(activeLayerId, m, width, height, transformedRegion(layer, m))),
+      applyOperation(
+        session.state,
+        createTransformOp(activeLayerId, m, width, height, transformedRegion(layer, m)),
+      ),
     );
     drawXformBox(c, quad);
   };
@@ -1491,9 +1807,12 @@ export function CanvasEditor({
   } | null>(null);
   const brushRafRef = useRef<number | null>(null);
   // ストローク作業用の canvas/ImageData を使い回すキャッシュ（stroke ごとの 4K≈67MB 確保＋GC を避ける）。
-  const brushActiveRef = useRef<{ canvas: HTMLCanvasElement; image: ImageData; w: number; h: number } | null>(
-    null,
-  );
+  const brushActiveRef = useRef<{
+    canvas: HTMLCanvasElement;
+    image: ImageData;
+    w: number;
+    h: number;
+  } | null>(null);
 
   // below/above（アクティブ層の下地・上層）の合成キャッシュ。連続して同じレイヤに短いストロークを
   // 何本も引く間、アクティブ以外のレイヤ構成は変わらない（state は不変なので、非アクティブな最上位
@@ -1572,7 +1891,12 @@ export function CanvasEditor({
       canvas.height = height;
       const cctx = canvas.getContext('2d');
       if (!cctx) return false;
-      cache = { canvas, image: cctx.createImageData(width, height), w: width, h: height };
+      cache = {
+        canvas,
+        image: cctx.createImageData(width, height),
+        w: width,
+        h: height,
+      };
       brushActiveRef.current = cache;
     }
     const activeCanvas = cache.canvas;
@@ -1732,13 +2056,23 @@ export function CanvasEditor({
     if (e.target === canvasRef.current) return;
     const startPan = () => {
       e.preventDefault();
-      panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
+      panningRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        left: panRef.current.x,
+        top: panRef.current.y,
+      };
       capturePointer(canvasRef.current, e.pointerId);
     };
     if (e.button === 1 || spaceHeld) return startPan();
     if (zoomKey) {
       e.preventDefault();
-      zoomDragRef.current = { startY: e.clientY, startZoom: zoomRef.current, anchorX: e.clientX, anchorY: e.clientY };
+      zoomDragRef.current = {
+        startY: e.clientY,
+        startZoom: zoomRef.current,
+        anchorX: e.clientX,
+        anchorY: e.clientY,
+      };
       capturePointer(canvasRef.current, e.pointerId);
     }
   };
@@ -1748,21 +2082,36 @@ export function CanvasEditor({
     // 中ボタンドラッグ = パン（ツール・キャンバスが収まっているかに関係なく視点移動）。
     if (e.button === 1) {
       e.preventDefault();
-      panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
+      panningRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        left: panRef.current.x,
+        top: panRef.current.y,
+      };
       capturePointer(canvasRef.current, e.pointerId);
       return;
     }
     // Space 長押し（視点移動モード）: ドラッグでパン（描画せず視点だけ動かす）。
     if (spaceHeld) {
       e.preventDefault();
-      panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
+      panningRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        left: panRef.current.x,
+        top: panRef.current.y,
+      };
       capturePointer(canvasRef.current, e.pointerId);
       return;
     }
     // Z 押下中（ズームモード）: 押下位置をカーソル基準に、上下ドラッグで拡大/縮小。
     if (zoomKey) {
       e.preventDefault();
-      zoomDragRef.current = { startY: e.clientY, startZoom: zoomRef.current, anchorX: e.clientX, anchorY: e.clientY };
+      zoomDragRef.current = {
+        startY: e.clientY,
+        startZoom: zoomRef.current,
+        anchorX: e.clientX,
+        anchorY: e.clientY,
+      };
       capturePointer(canvasRef.current, e.pointerId);
       return;
     }
@@ -1800,7 +2149,14 @@ export function CanvasEditor({
       const hit = hitTransform(pt.x, pt.y, bb);
       if (!hit) return;
       if (hit.mode === 'move') {
-        xformRef.current = { mode: 'move', startX: pt.x, startY: pt.y, bbox: bb, dx: 0, dy: 0 };
+        xformRef.current = {
+          mode: 'move',
+          startX: pt.x,
+          startY: pt.y,
+          bbox: bb,
+          dx: 0,
+          dy: 0,
+        };
       } else if (hit.mode === 'scale') {
         const cs = bboxCorners(bb);
         const [gx, gy] = cs[hit.corner];
@@ -1853,7 +2209,12 @@ export function CanvasEditor({
       const d = panningRef.current;
       // 命令的に pan（再レンダーを挟まない）。確定は pointerup（endPanGesture）で行う。
       panGestureRef.current = true;
-      applyPan(clampPan({ x: d.left + (e.clientX - d.x), y: d.top + (e.clientY - d.y) }));
+      applyPan(
+        clampPan({
+          x: d.left + (e.clientX - d.x),
+          y: d.top + (e.clientY - d.y),
+        }),
+      );
       if (showCursor) moveCursor(e.clientX, e.clientY); // パン中もリングカーソルを追従させる
       return;
     }
@@ -1899,7 +2260,8 @@ export function CanvasEditor({
         drawingRef.current.strokes.push(pt);
         if (brushPreviewRef.current) advanceBrush(pt); // 新区間だけ増分スタンプ（軽い）
       }
-      if (brushPreviewRef.current) scheduleBrushPreview(); // 合成は rAF で1フレーム1回に間引く
+      if (brushPreviewRef.current)
+        scheduleBrushPreview(); // 合成は rAF で1フレーム1回に間引く
       else renderStrokePreview(drawingRef.current.strokes);
     } else if (xformRef.current) {
       const g = xformRef.current;
@@ -1913,13 +2275,27 @@ export function CanvasEditor({
           // Shift: 縦横独立（負値で反転も可）
           const sx = clampScale((pt.x - f.x) / (g.corner.x - f.x));
           const sy = clampScale((pt.y - f.y) / (g.corner.y - f.y));
-          g.matrix = { a: sx, b: 0, c: 0, d: sy, e: f.x - sx * f.x, f: f.y - sy * f.y };
+          g.matrix = {
+            a: sx,
+            b: 0,
+            c: 0,
+            d: sy,
+            e: f.x - sx * f.x,
+            f: f.y - sy * f.y,
+          };
         } else {
           // 等比: 固定点（対角の頂点）からの距離比
           const s = clampScale(
             Math.hypot(pt.x - f.x, pt.y - f.y) / Math.hypot(g.corner.x - f.x, g.corner.y - f.y),
           );
-          g.matrix = { a: s, b: 0, c: 0, d: s, e: f.x - s * f.x, f: f.y - s * f.y };
+          g.matrix = {
+            a: s,
+            b: 0,
+            c: 0,
+            d: s,
+            e: f.x - s * f.x,
+            f: f.y - s * f.y,
+          };
         }
       } else {
         let deg = ((Math.atan2(pt.y - g.pivot.y, pt.x - g.pivot.x) - g.startAngle) * 180) / Math.PI;
@@ -1936,7 +2312,9 @@ export function CanvasEditor({
       drawOverlay();
     } else if (shapeRef.current) {
       const pt = getPoint(e);
-      renderStrokePreview(shapeStrokes(shapeRef.current.startX, shapeRef.current.startY, pt.x, pt.y));
+      renderStrokePreview(
+        shapeStrokes(shapeRef.current.startX, shapeRef.current.startY, pt.x, pt.y),
+      );
     }
   };
 
@@ -2076,7 +2454,11 @@ export function CanvasEditor({
   };
 
   // scale(s, 中心 pivot) と rotate(deg) を合成したキャンバス座標アフィン行列。
-  const buildMatrix = (s: number, deg: number, pivot: { x: number; y: number }): TransformParams => {
+  const buildMatrix = (
+    s: number,
+    deg: number,
+    pivot: { x: number; y: number },
+  ): TransformParams => {
     const rad = (deg * Math.PI) / 180;
     const a = Math.cos(rad) * s;
     const b = Math.sin(rad) * s;
@@ -2137,8 +2519,13 @@ export function CanvasEditor({
     const baseState = xformBaseStateRef.current;
     const baseLayer = baseState ? getLayer(baseState, activeLayerId) : undefined;
     const continues =
-      !!streak && !!last && last.id === streak.opId && last.type === 'transform' &&
-      last.layerId === activeLayerId && !!baseState && !!baseLayer;
+      !!streak &&
+      !!last &&
+      last.id === streak.opId &&
+      last.type === 'transform' &&
+      last.layerId === activeLayerId &&
+      !!baseState &&
+      !!baseLayer;
     if (continues) {
       const cumulative = composeMatrix(m, streak!.cumulative);
       const after = transformedRegion(baseLayer!, cumulative);
@@ -2179,7 +2566,10 @@ export function CanvasEditor({
     if (!layer || !pivot) return;
     const a = axis === 'h' ? -1 : 1;
     const d = axis === 'v' ? -1 : 1;
-    applyTransformMatrix({ a, b: 0, c: 0, d, e: pivot.x - a * pivot.x, f: pivot.y - d * pivot.y }, layer);
+    applyTransformMatrix(
+      { a, b: 0, c: 0, d, e: pivot.x - a * pivot.x, f: pivot.y - d * pivot.y },
+      layer,
+    );
   };
 
   const addLayer = () => {
@@ -2236,8 +2626,20 @@ export function CanvasEditor({
       const buffer = await file.arrayBuffer();
       // ag-psd は大きいので初回インポート時だけ動的ロード（初期表示を軽く保つ）。
       const { buildPsdImportOps } = await import('./psdImport');
-      const { ops, width: w, height: h, leafCount, groupCount, clipCount, scaled, psdWidth, psdHeight } =
-        buildPsdImportOps(buffer, MAX_CANVAS_DIM);
+      const {
+        ops,
+        width: w,
+        height: h,
+        leafCount,
+        groupCount,
+        clipCount,
+        multiplyCount,
+        droppedBlendCount,
+        collapsedGroupIds,
+        scaled,
+        psdWidth,
+        psdHeight,
+      } = buildPsdImportOps(buffer, MAX_CANVAS_DIM);
       if (ops.length === 0) {
         alert('PSD に取り込めるレイヤーが見つかりませんでした。');
         return;
@@ -2252,10 +2654,16 @@ export function CanvasEditor({
         return;
       }
       onLoadPsdDocument(w, h, ops);
+      // PSD で畳まれていたフォルダは畳んだまま開く。開閉は op ではないので、ここで直接覚える。
+      setCollapseOverride(new Map(collapsedGroupIds.map((id) => [id, true])));
       console.info(
         `PSD を取り込みました: ${w}×${h}（PSD 実寸 ${psdWidth}×${psdHeight}）/ ` +
           `${leafCount} レイヤー / ${groupCount} フォルダ` +
           (clipCount ? ` / クリッピング ${clipCount}` : '') +
+          (multiplyCount ? ` / 乗算 ${multiplyCount}` : '') +
+          (droppedBlendCount
+            ? ` / 未対応のブレンドモード ${droppedBlendCount}（通常合成に倒しました）`
+            : '') +
           (scaled ? '（上限を超えるため縮小）' : ''),
       );
     } catch (err) {
@@ -2284,9 +2692,15 @@ export function CanvasEditor({
   // ドラッグ中は合成し直さず、破線の枠(resizeOutlineRef)を命令的に動かすだけ（軽い）。離した位置で
   // changeCanvasSize を1回呼んで確定する。左上(0,0)固定なので中身のオフセットは変えない。
   const RESIZE_MIN = 16;
-  const resizeDragRef = useRef<{ axis: 'w' | 'h'; startX: number; startY: number; startW: number; startH: number; curW: number; curH: number } | null>(
-    null,
-  );
+  const resizeDragRef = useRef<{
+    axis: 'w' | 'h';
+    startX: number;
+    startY: number;
+    startW: number;
+    startH: number;
+    curW: number;
+    curH: number;
+  } | null>(null);
   const resizeOutlineRef = useRef<HTMLDivElement>(null);
 
   const showResizeOutline = (w: number, h: number) => {
@@ -2303,7 +2717,15 @@ export function CanvasEditor({
     e.preventDefault();
     e.stopPropagation();
     capturePointer(e.currentTarget as HTMLElement, e.pointerId);
-    resizeDragRef.current = { axis, startX: e.clientX, startY: e.clientY, startW: width, startH: height, curW: width, curH: height };
+    resizeDragRef.current = {
+      axis,
+      startX: e.clientX,
+      startY: e.clientY,
+      startW: width,
+      startH: height,
+      curW: width,
+      curH: height,
+    };
     showResizeOutline(width, height);
   };
 
@@ -2312,11 +2734,17 @@ export function CanvasEditor({
     if (!d) return;
     const w =
       d.axis === 'w'
-        ? Math.max(RESIZE_MIN, Math.min(MAX_CANVAS_DIM, Math.round(d.startW + (e.clientX - d.startX) / zoom)))
+        ? Math.max(
+            RESIZE_MIN,
+            Math.min(MAX_CANVAS_DIM, Math.round(d.startW + (e.clientX - d.startX) / zoom)),
+          )
         : d.startW;
     const h =
       d.axis === 'h'
-        ? Math.max(RESIZE_MIN, Math.min(MAX_CANVAS_DIM, Math.round(d.startH + (e.clientY - d.startY) / zoom)))
+        ? Math.max(
+            RESIZE_MIN,
+            Math.min(MAX_CANVAS_DIM, Math.round(d.startH + (e.clientY - d.startY) / zoom)),
+          )
         : d.startH;
     d.curW = w;
     d.curH = h;
@@ -2355,6 +2783,46 @@ export function CanvasEditor({
   const nodeRegion = (n: LayerNode) => (isGroup(n) ? undefined : layerContentBBox(n));
   const leafCount = () => session.state.layers.flatMap(collectLeafIds).length;
 
+  /**
+   * レイヤー操作ボタンの対象を解決する。行にボタンを置かない代わりに、「どの行に効くのか」の
+   * 判定はここ 1 か所に集約する。
+   *
+   * スロット（横軸）を選んでいるときは、いまそこに出ている差分に効かせる。行に見えているのは
+   * その 1 枚なので、ボタンの効き先も同じにしないと「見えているものと違うものが変わる」ことになる。
+   * stack が非 null なら、その対象は差分（＝削除は「差分を 1 枚捨てる」になる）。
+   *
+   * slot は「行そのもの」。中身（差分）に効く操作と、行に効く操作は別物なので分けている
+   * （表示/非表示は行の性質。中身ごとの非表示は、スロットの排他性と二重になるので持たせない）。
+   */
+  const opTarget = (): {
+    node: LayerNode;
+    leaf: Layer | null;
+    stack: LayerGroup | null;
+    slot: LayerNode;
+  } | null => {
+    const raw =
+      getNode(session.state, selectedId) ?? getNode(session.state, session.state.activeLayerId);
+    if (!raw) return null;
+    const node = isVariantStack(raw) ? (activeVariant(raw) ?? raw) : raw;
+    const stack = getVariantStackOf(session.state, node.id) ?? null;
+    return {
+      node,
+      leaf: isGroup(node) ? null : node,
+      stack,
+      slot: stack ?? node,
+    };
+  };
+
+  /**
+   * 表示/非表示の効き先。「行ごと一時的に絵から外す」なので、スロット（行）に効かせる。
+   *
+   * ただし正規化前のデータ（＝スロットに入る前から非表示だったもの）では中身に非表示が
+   * 残っていることがあり、行側だけを対象にすると直せなくなって詰む。中身に立っているときだけ
+   * そちらを対象にして、押せば必ず「出る」方向へ収束させる。
+   */
+  const visibilityTarget = (t: NonNullable<ReturnType<typeof opTarget>>): LayerNode =>
+    t.node.visible === false ? t.node : t.slot;
+
   const toggleVisibility = (n: LayerNode) => {
     if (previewing) return;
     session.apply(createSetLayerVisibilityOp(n.id, !n.visible, nodeRegion(n)));
@@ -2376,6 +2844,16 @@ export function CanvasEditor({
     repaint();
   };
 
+  // 合成方法（いまは 通常 ⇄ 乗算 のトグル）。リーフ・フォルダどちらにも効く。
+  // フォルダに掛けると、そのフォルダの合成結果まるごとが下地に掛かる（＝影のフォルダを一括で乗算）。
+  const toggleMultiply = (n: LayerNode) => {
+    if (previewing) return;
+    const next = n.blendMode === 'multiply' ? 'normal' : 'multiply';
+    session.apply(createSetLayerBlendModeOp(n.id, next, nodeRegion(n)));
+    onEdit();
+    repaint();
+  };
+
   const deleteLayer = (n: LayerNode) => {
     if (previewing) return;
     if (leafCount() - collectLeafIds(n).length < 1) return; // 最低1リーフを残す
@@ -2390,16 +2868,49 @@ export function CanvasEditor({
   // アクティブレイヤーの居るスロット。既に横軸なら右隣へ、まだなら その場で横軸化して 2 つ目にする。
   const addVariant = (copy: boolean) => {
     if (previewing) return;
-    const target = getNode(session.state, activeLayerId);
-    if (!target) return;
-    const stack = getVariantStackOf(session.state, activeLayerId);
+    const t = opTarget();
+    if (!t) return;
+    const target = t.node;
+    const stack = t.stack;
     const count = stack ? stack.children.length : 1;
     const name = copy ? `${target.name} copy` : `Var ${count + 1}`;
     markDirty('full');
     session.apply(
       createAddVariantOp(target.id, stack?.id ?? genId('variants'), genId('layer'), name, copy),
     );
+    // op は新しい差分を描き先にする。選択もそこへ移して、続けて操作できるようにする。
     setActiveLayerId(session.state.activeLayerId);
+    setSelectedId(session.state.activeLayerId);
+    onEdit();
+  };
+
+  /**
+   * 空スロットを足す。「この行には何も無い」を、フラグではなく選べる中身にする。
+   *
+   * これが「非表示にして残す」の置き換え。中身ごとの非表示だと、
+   *   - 出ていない差分の非表示は誰にも効かない（死んだデータ）
+   *   - スライドして出した瞬間に「出したのに何も無い」になる
+   * 空スロットなら、無いことが横並びの 1 枚として見え、状態の所属先にもなれる（規則4 の実体）。
+   */
+  const addEmptySlot = () => {
+    if (previewing) return;
+    const t = opTarget();
+    if (!t) return;
+    markDirty('full');
+    session.apply(
+      createAddVariantOp(
+        t.node.id,
+        t.stack?.id ?? genId('variants'),
+        genId('empty'),
+        '（空）',
+        false,
+        undefined,
+        true,
+      ),
+    );
+    // 空スロットは描き先になれない（リーフが無い）。選択だけそのスロットへ寄せる。
+    setActiveLayerId(session.state.activeLayerId);
+    setSelectedId(getVariantStackOf(session.state, t.node.id)?.id ?? t.node.id);
     onEdit();
   };
 
@@ -2418,11 +2929,9 @@ export function CanvasEditor({
     onEdit();
   };
 
-  // アクティブレイヤーの内容を全消去（透明化）。1操作として記録され Undo 可能。
-  const clearActiveLayer = () => {
+  // レイヤーの内容を全消去（透明化）。レイヤー自体は残る。1操作として記録され Undo 可能。
+  const clearLayerContent = (layer: Layer) => {
     if (previewing) return;
-    const layer = getActiveLayer();
-    if (!layer) return;
     session.apply(createClearLayerOp(layer.id, width, height, layerContentBBox(layer)));
     onEdit();
     repaint();
@@ -2507,6 +3016,8 @@ export function CanvasEditor({
   // ボタン/入力欄の上では保留しない（そのコントロールのクリック/入力を優先）。
   // 保留のまま LAYER_LIFT_MS 押し続けると持ち上がり、⠿ グリップからならすぐ持ち上がる。
   const onRowPointerDown = (n: LayerNode, e: ReactPointerEvent) => {
+    // 新しいジェスチャの開始。前のジェスチャの「クリックを飲む」フラグはここで必ず落とす。
+    gestureConsumedRef.current = false;
     if (previewing) return;
     if (e.button !== 0) return; // 主ボタン（左/ペン接地）のみ
     const el = e.target as HTMLElement | null;
@@ -2518,6 +3029,7 @@ export function CanvasEditor({
       startY: e.clientY,
       pointerId: e.pointerId,
       el: e.currentTarget as HTMLElement,
+      kind: 'row',
     };
     if (el && el.closest('.layer-grip')) {
       liftRow(); // 掴む取っ手からは待たずに持ち上げる
@@ -2526,10 +3038,78 @@ export function CanvasEditor({
     liftTimerRef.current = window.setTimeout(liftRow, LAYER_LIFT_MS);
   };
 
+  /**
+   * カルーセルのコマを掴む。行と違って「動かしたら持ち上げ」（横に動かしてもスライドにしない）。
+   *
+   * コマは横軸の中の 1 枚そのものなので、掴んで動かす意味は 2 つしかない:
+   *   同じカルーセルの別の位置へ落とす → 差分の並べ替え
+   *   カルーセルの外（他の行）へ落とす → スロットから取り出して普通のレイヤーに戻す（＝分解）
+   * どちらも既存の D&D 経路（dropHint → performDrop）に乗るので、ここは掴む所だけを作る。
+   */
+  const onChipPointerDown = (variant: LayerNode, e: ReactPointerEvent) => {
+    gestureConsumedRef.current = false;
+    if (previewing) return;
+    if (e.button !== 0) return;
+    // コマの上は「このコマを掴む」。帯の地に届かせない（届くと帯のスライドが同時に始まる）。
+    e.stopPropagation();
+    cancelLiftTimer();
+    pendingDragRef.current = {
+      id: variant.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      pointerId: e.pointerId,
+      el: e.currentTarget as HTMLElement,
+      kind: 'chip',
+    };
+    // コマは小さいので長押しは待たない。ただし即持ち上げるとクリック（＝この差分に切り替え）が
+    // 死ぬので、しきい値を超えて動いたときだけ持ち上げる（判定は onRowPointerMove 側）。
+    liftTimerRef.current = window.setTimeout(liftRow, LAYER_LIFT_MS);
+  };
+
+  /**
+   * 帯の地（コマの載っていないところ）を掴む＝横軸そのものを引っ張る。押した時点でスライドに入る。
+   *
+   * 掴める場所は「帯のうちコマ以外の全部」: 両端の余白も、コマとコマの隙間も、コマの上下も同じ。
+   * 帯の中には意味が 2 つしか無く（コマ＝その 1 枚を掴む／地＝帯そのものを引く）、見た目で
+   * どちらかが分かる（コマが有るか無いか）ので、境目を細かく覚えなくていい。
+   * コマ側は onChipPointerDown が伝播を止めるので、ここには来ない。
+   *
+   * 行を掴む場合（onRowPointerDown）と違って「時間で移動と分ける」必要が無い: ここは帯の中で、
+   * 行を持ち上げる意味が無い場所だから、迷わず 1 つの意味に決められる。
+   * 引かずに離せばただのクリック＝行の選択（帯の onClick）になる。
+   */
+  const onPullPointerDown = (stack: LayerGroup, e: ReactPointerEvent) => {
+    gestureConsumedRef.current = false;
+    if (previewing) return;
+    if (e.button !== 0) return;
+    cancelLiftTimer();
+    pendingDragRef.current = null;
+    const at = variantIndexOf(stack);
+    swipeRef.current = {
+      stackId: stack.id,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      baseIndex: at,
+      count: stack.children.length,
+      index: at,
+      dx: 0,
+    };
+    capturePointer(e.currentTarget as HTMLElement, e.pointerId);
+    setSwipingStackId(stack.id); // 指を離すまで帯を開けたままにする
+  };
+
   // ---- レイヤーの横軸（差分スタック）の切り替え ----
-  // 行に差分のサムネイルを横に並べ、ホバーで「その差分が出ている絵」を仮に見せ、
-  // クリックで確定する。覗き見の間は state を一切触らず displayState() で差し替えるだけなので、
-  // 見比べても履歴は汚れない（確定して初めて 1 op = Undo 1 回になる）。
+  // 選ぶのは【クリック】と【左右スライド】の 2 つだけ。どちらも手を動かして起こす操作なので、
+  // 絵が差し替わっても意図どおりに見える。
+  //
+  // 以前はコマに**乗せただけ**でも絵を差し替えていた（覗き見）。見比べは速いが、
+  //   ・カルーセルを開こうとして通りかかっただけで絵が変わる（驚く）
+  //   ・「いま見ているのは確定した絵か、覗いている絵か」が手を止めるまで分からない
+  //   ・帯が閉じる経路と覗き見を戻す経路が別々なので、戻し損ねると覗いたままの絵が残る
+  // ので廃止した。見比べは , / . キー（1 op ずつ確定して往復）で行う。
+  //
+  // 覗き見の仕組み自体は左右スライド中の追従に使う: 指を動かしている間だけ中央の枠に来た 1 枚を
+  // 見せ、離した時点で 1 op = Undo 1 回として確定する（見比べても履歴は汚れない）。
   const peekVariant = (stack: LayerGroup, index: number) => {
     if (previewing || dragIdRef.current) return; // 並べ替えドラッグ中に覗き見が割り込まないように
     const base = variantIndexOf(stack);
@@ -2630,6 +3210,67 @@ export function CanvasEditor({
     if (stack) stepVariant(stack, delta);
   };
 
+  // ---- 状態(state)と所属(attachment) ------------------------------------------
+  // 別の行に散らばった差分どうしの関係を、利用者が名前で覚えて手で揃えるのをやめて、
+  // 「くっついている」という関係として保持する。維持はシステム側の仕事になる。
+
+  /** 状態を 1 つ作る。この時点では何も所属していない（空のレールが 1 本立つだけ）。 */
+  const addState = () => {
+    if (previewing) return;
+    session.apply(createAddStateOp(genId('state'), `ver${listStates(session.state).length + 1}`));
+    onEdit();
+  };
+
+  /** 状態を消す。付いていた所属が一斉に外れるだけで、スロットは 1 つも消えない（規則7）。 */
+  const deleteState = (st: VariantState) => {
+    if (previewing) return;
+    if (editingStateId === st.id) setEditingStateId(null);
+    session.apply(createRemoveStateOp(st.id));
+    onEdit();
+  };
+
+  const startStateRename = (st: VariantState) => {
+    setEditingStateId(st.id);
+    setEditingStateName(st.name);
+  };
+
+  const commitStateRename = (st: VariantState) => {
+    setEditingStateId(null);
+    const name = editingStateName.trim();
+    if (!name || name === st.name) return;
+    session.apply(createRenameStateOp(st.id, name));
+    onEdit();
+  };
+
+  /**
+   * 状態を出す。所属している行が一斉に切り替わり、スロットが 1 つの行（＝自動共有）は動かない。
+   * これが 1 操作で済むかどうかが、この設計の一番の見どころ。
+   */
+  const applyStateNow = (st: VariantState) => {
+    if (previewing) return;
+    markDirty('full'); // 複数行の差分が入れ替わるので絵の全面が変わりうる
+    session.apply(createApplyStateOp(st.id));
+    setActiveLayerId(session.state.activeLayerId);
+    onEdit();
+  };
+
+  /**
+   * 行の上でレールを押したときの所属の付け外し（1 クリック）。
+   *   付いていない            → いま出ているスロットにくっつける
+   *   付いていて、それが今出ている → 外す（＝この行ではどのスロットも選ばない。規則4）
+   *   付いているが別のスロット   → いま出ているスロットへ付け替える
+   * 「いま出ているスロット」を宛先にするので、行に見えているものと結果が一致する。
+   */
+  const toggleAttachment = (stateId: string, rowId: string) => {
+    if (previewing) return;
+    const t = attachTarget(session.state, rowId);
+    if (!t) return;
+    const cur = liveAttachment(session.state, stateId, t.stack.id);
+    const next = cur?.slotId === t.slotId ? null : t.slotId;
+    session.apply(createSetAttachmentOp(stateId, t.stack.id, next));
+    onEdit();
+  };
+
   // 保留中ならしきい値超えで本ドラッグを開始。ドラッグ中は pointer 位置の直下の行を判定し、
   // 上/中/下のドロップ位置ヒントを更新する。
   const onRowPointerMove = (e: ReactPointerEvent) => {
@@ -2639,10 +3280,16 @@ export function CanvasEditor({
       return;
     }
     if (!dragIdRef.current) {
-      // まだ持ち上がっていない。動き出したなら、それはスライド（差分の切り替え）。
       const p = pendingDragRef.current;
       if (!p || e.pointerId !== p.pointerId) return;
       if (Math.hypot(e.clientX - p.startX, e.clientY - p.startY) < LAYER_GESTURE_THRESHOLD) return;
+      // カルーセルのコマは、動かした時点で持ち上げ（横に動かしてもスライドにはしない）。
+      if (p.kind === 'chip') {
+        liftRow();
+        if (dragIdRef.current) positionGhost(e.clientX, e.clientY);
+        return;
+      }
+      // 行を動かし出したなら、それはスライド（差分の切り替え）。
       const stack = getNode(session.state, p.id);
       if (stack && isVariantStack(stack) && stack.children.length >= 2) {
         cancelLiftTimer(); // スライドに入ったら持ち上げない（片方だけが起きる）
@@ -2668,11 +3315,79 @@ export function CanvasEditor({
     if (!dragged) return;
     positionGhost(e.clientX, e.clientY);
     const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
-    const head = el?.closest('.layer-head') as HTMLElement | null;
+
+    // どの行の上に居るかは**行の箱**から取る。カルーセルは .layer-head の兄弟なので、
+    // head から辿ると「帯の上に居る＝どの行でもない」になってしまい、帯が開いた瞬間に閉じて
+    // またすぐ開く、というちらつきの輪ができる（帯が閉じるとコマごと消えて狙えない）。
+    const item = el?.closest('.layer-item') as HTMLElement | null;
+    const head = item?.querySelector<HTMLElement>(':scope > .layer-head[data-id]') ?? null;
     const targetId = head?.dataset.id;
     const tn = targetId ? getNode(session.state, targetId) : undefined;
     const dn = getNode(session.state, dragged);
-    if (!head || !targetId || !tn || targetId === dragged || (dn && collectNodeIds(dn).includes(targetId))) {
+    // pointer capture 中は他の行の pointerenter が飛んでこないので、ここで開ける。
+    // 開かないとコマが DOM に無く、「どのコマの隣へ落とすか」を狙えない。
+    setHoverStackId((p) => {
+      const want = tn && isVariantStack(tn) ? tn.id : null;
+      return p === want ? p : want;
+    });
+
+    // 掴んだ位置からの横移動量。「横へ持っていく＝差分にする」の判定に使う（下の pos 決めと共用）。
+    const dx = e.clientX - (dragOriginRef.current?.x ?? e.clientX);
+    // 帯の上なら、そこが落とし先。指すのは【コマの左半分か右半分か】＝そのコマの隣。
+    //
+    // 以前はコマとコマの間に「隙間」を N+1 個開いて、その箱を狙わせていた。落とせる場所そのものを
+    // 見せる形ではあったが、緑の箱が並ぶぶん帯の絵が作り変わり、何がどこにあるのか読めなくなる。
+    // いまはコマの並びはそのままで、狙っているコマの入る側に線を 1 本出すだけにした
+    // （当たり判定はコマ半分＝24px 前後あるので、細い線を狙わせることにもならない）。
+    const band = el?.closest('.variant-carousel') as HTMLElement | null;
+    if (band) {
+      const onChip = el?.closest('.vc-chip') as HTMLElement | null;
+      const draggedIds = dn ? collectNodeIds(dn) : [];
+      // 掴んでいるコマ自身の上＝「動かさない」。ここで隣を指すと、その場に置いたつもりが
+      // 1 つずれる（自分の左右はどちらも同じ位置なので、指せることに意味も無い）。
+      if (!onChip || !draggedIds.includes(onChip.dataset.id ?? '')) {
+        // 帯のどこに居ても、いちばん近いコマの左右どちらかを指す（コマの上下・間・両端も同じ）。
+        // 指す先が細切れに消えないので、帯の中で指を動かしても印がちらつかない。
+        let best: { id: string; pos: DropPos } | null = null;
+        let bestDist = Infinity;
+        for (const chip of band.querySelectorAll<HTMLElement>('.vc-chip[data-id]')) {
+          const id = chip.dataset.id!;
+          if (draggedIds.includes(id)) continue;
+          const cr = chip.getBoundingClientRect();
+          const mid = (cr.left + cr.right) / 2;
+          const dist = Math.abs(e.clientX - mid);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = { id, pos: e.clientX < mid ? 'left' : 'right' };
+          }
+        }
+        if (best) {
+          setDropHint((p) => (p && p.id === best!.id && p.pos === best!.pos ? p : best));
+          return;
+        }
+      }
+      // 落とし先を決められない（掴んでいるコマの上／コマが 1 つも無い）。
+      // ただし「まだ差分の無い行を初めて横へ持っていく」ときは、帯そのものがこのヒントで出ている。
+      // ここで落とすと 帯が消える → 行に戻る → またヒントが立つ、のちらつきの輪になるので、
+      // 横へずらしたままの間は保つ（指を戻せば普通の並べ替えに戻る）。
+      const keepBeside = !!tn && !isVariantStack(tn) && Math.abs(dx) >= VARIANT_DROP_DX;
+      setDropHint((p) =>
+        !p
+          ? p
+          : keepBeside && p.id === targetId && (p.pos === 'left' || p.pos === 'right')
+            ? p
+            : null,
+      );
+      return;
+    }
+
+    if (
+      !head ||
+      !targetId ||
+      !tn ||
+      targetId === dragged ||
+      (dn && collectNodeIds(dn).includes(targetId))
+    ) {
       setDropHint((p) => (p ? null : p));
       return;
     }
@@ -2680,11 +3395,11 @@ export function CanvasEditor({
     const r = (e.clientY - rect.top) / Math.max(1, rect.height);
     // 掴んだ位置から横へ大きくずらしていたら「横に並べる（差分にする）」。
     // 縦にずらしているだけなら今までどおりの並べ替え／フォルダ出し入れ。
-    const dx = e.clientX - (dragOriginRef.current?.x ?? e.clientX);
     let pos: DropPos;
     if (Math.abs(dx) >= VARIANT_DROP_DX) {
       pos = dx < 0 ? 'left' : 'right';
-    } else if (isGroup(tn)) {
+    } else if (isGroup(tn) && !isEmptySlot(tn)) {
+      // 空スロットは「何も無い」を表す中身なので、収納先にはできない（中身が入れば空でなくなる）。
       pos = r < 0.28 ? 'above' : r > 0.72 ? 'below' : 'into';
     } else {
       pos = r < 0.5 ? 'above' : 'below';
@@ -2698,6 +3413,10 @@ export function CanvasEditor({
     // スライドの確定: 動いていれば 1 op（Undo 1 回）、動いていなければ覗き見を戻すだけ。
     const sw = swipeRef.current;
     if (sw) {
+      // 引いた（＝帯が動いた）ときだけ、後続の click を選択として扱わない。
+      // 帯の地は押した時点でスライドに入るので、ここで一律に食べてしまうと
+      // 「帯の上を押して行を選ぶ」が効かなくなる（帯は行を覆っている）。
+      if (sw.dx !== 0) gestureConsumedRef.current = true;
       swipeRef.current = null;
       setSwipingStackId(null); // カルーセルを畳む
       try {
@@ -2712,6 +3431,7 @@ export function CanvasEditor({
     }
     const dragged = dragIdRef.current;
     if (!dragged) return; // 持ち上がる前に離した＝クリック。選択/リネーム/ボタンの通常処理に任せる。
+    gestureConsumedRef.current = true; // 持ち上げて離した＝移動。後続の click は選択にしない
     const hint = dropHint;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
@@ -2722,6 +3442,7 @@ export function CanvasEditor({
     dragOriginRef.current = null;
     setDragGhost(null);
     setDropHint(null);
+    setHoverStackId(null); // 木が変わるので開けたままにしない（動かせば pointerenter で開き直す）
     if (previewing || !dragged) return;
     if (hint) {
       performDrop(dragged, hint.id, hint.pos);
@@ -2729,9 +3450,12 @@ export function CanvasEditor({
     }
     const over = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
     // 行の上でなく、レイヤーリストの余白で離したときは最上位の最前面へ（フォルダから出す）。
+    // カルーセルの上は「余白」ではない: 帯は .layer-head の兄弟なので closest('.layer-head') が
+    // 空振りし、位置を決めずに離しただけで最上位へ飛ばされてしまう。明示的に除く。
     if (
       over &&
       !over.closest('.layer-head') &&
+      !over.closest('.variant-carousel') &&
       over.closest('.layer-list') &&
       getNode(session.state, dragged)
     ) {
@@ -2835,9 +3559,25 @@ export function CanvasEditor({
     }
   };
 
+  /**
+   * フォルダの開閉。log にも undo にも載せない。
+   *
+   * 以前は op（setGroupCollapsed）だった。絵は何も変わらないのに開閉のたびに 1 op 積まれ、
+   * undo を 1 回ぶん食っていた（畳んだあと Undo すると、直前の描画ではなく開閉が戻る）。
+   * 見た目にしか影響しないものは state に入れない、という切り分けにした。
+   *
+   * 既定は「開いている」。畳んだものだけを覚える（畳み直せばエントリを消すので、
+   * 消えたレイヤーの分が溜まらない）。スロット（横軸）に開閉は無い＝カルーセルが担当する。
+   */
+  const isCollapsed = (g: LayerGroup): boolean => collapseOverride.get(g.id) ?? false;
+
   const toggleCollapse = (g: LayerGroup) => {
-    session.apply(createSetGroupCollapsedOp(g.id, !g.collapsed));
-    onEdit();
+    setCollapseOverride((prev) => {
+      const m = new Map(prev);
+      if (isCollapsed(g)) m.delete(g.id);
+      else m.set(g.id, true);
+      return m;
+    });
   };
 
   // 空フォルダを最上位に追加。
@@ -2848,23 +3588,12 @@ export function CanvasEditor({
     repaint();
   };
 
-  // レイヤー名クリック: グループは開閉、リーフはアクティブ化。
+  // レイヤー名クリック: その行を「操作の対象」にする（リーフなら描き先も一緒に動く）。
+  // フォルダの開閉は ▸/▾ に任せる（クリックの意味を1つに保ち、選ぶたびに畳まれないようにする）。
   const onLayerClick = (n: LayerNode) => {
-    // 開いたスロットの中で控えの差分をクリックしたら、それをそのスロットに出す
-    // （左右スライドと同じことを、一覧から直接選べるようにする）。
-    const inStack = getVariantStackOf(session.state, n.id);
-    if (inStack && activeVariant(inStack)?.id !== n.id) {
-      const at = inStack.children.findIndex((c) => c.id === n.id);
-      if (at >= 0) {
-        chooseVariant(inStack, at);
-        return;
-      }
-    }
-    if (isGroup(n)) {
-      toggleCollapse(n);
-      return;
-    }
-    setActiveLayerId(n.id);
+    // 差分の切り替えはカルーセルのコマ側（chooseVariant）が担当するので、ここは選択だけ。
+    setSelectedId(n.id);
+    if (!isGroup(n)) setActiveLayerId(n.id); // 描き先はリーフのときだけ動かす
   };
 
   const onOpacityInput = (n: LayerNode, v: number) => {
@@ -2903,13 +3632,16 @@ export function CanvasEditor({
     }
     return id;
   };
-  // 合成結果に影響する要素の署名（グループサムネは子の可視/不透明度/クリップ/内容で決まる）。
+  // 合成結果に影響する要素の署名（グループサムネは子の可視/不透明度/クリップ/合成方法/内容で決まる）。
+  const blendSig = (n: LayerNode): string => (n.blendMode === 'multiply' ? 'm' : '');
   const renderSig = (n: LayerNode): string =>
     isGroup(n)
-      ? `g${n.visible ? 1 : 0}.${Math.round(n.opacity * 100)}[${n.children.map(renderSig).join(',')}]`
+      ? `g${n.visible ? 1 : 0}.${Math.round(n.opacity * 100)}${blendSig(n)}[${n.children
+          .map(renderSig)
+          .join(',')}]`
       : `l${bufId(n.buffer)}@${n.offsetX},${n.offsetY}.${n.visible ? 1 : 0}.${Math.round(
           n.opacity * 100,
-        )}.${n.clipped ? 1 : 0}`;
+        )}.${n.clipped ? 1 : 0}${blendSig(n)}`;
   // そのノード自身のサムネ署名（リーフは内容のみ、グループは子の合成結果）。
   const thumbSig = (n: LayerNode): string =>
     isGroup(n)
@@ -2945,6 +3677,26 @@ export function CanvasEditor({
     return url;
   };
 
+  /**
+   * 行のサムネイルの左右から覗く控えの差分。行を見ただけで「横に並んでいる／どちら側に続きがある」
+   * が分かるようにする、横軸そのものの絵。
+   *
+   * サムネイルの後ろへ潜り込ませて（重ねて）置くので、束ねた紙の端が見えている形になる。
+   * 押す対象にはしない（pointer-events:none）: 選ぶ・並べ替える・足すは全部カルーセルの仕事で、
+   * 行にはもう押せる小物を増やさない。
+   */
+  const renderAxisPeek = (c: LayerNode, side: 'prev' | 'next') => (
+    <span
+      key={`peek:${side}`}
+      // 覗きは 12px しか見えないので、フォルダの形（タブ）までは持たせない
+      // （形を付けると輪郭の緑が消えて、覗きそのものが見えなくなる）。
+      className={`axis-peek is-${side}${isEmptySlot(c) ? ' is-empty' : ''}`}
+      aria-hidden="true"
+    >
+      {!isEmptySlot(c) && <img src={layerThumb(c)} alt="" draggable={false} />}
+    </span>
+  );
+
   // レイヤーツリーを再帰描画（フォルダは折りたたみ可。表示は上=最前面なので reverse）。
   const renderNode = (n: LayerNode, depth: number, siblings: LayerNode[]) => {
     const stack = isVariantStack(n) ? n : null;
@@ -2957,97 +3709,154 @@ export function CanvasEditor({
     const node = stack ? stack.children[shownIndex] : n;
     if (!node) return null; // 空スタック（通常は起きない）は行を出さない
     const slotId = stack ? stack.id : node.id;
-    const grp = isGroup(node) ? node : null;
-    const leaf = grp ? null : (node as Layer);
+    const emptySlot = isEmptySlot(node); // この行にいま出ているのは「何も無い」
+    const grp = isGroup(node) && !emptySlot ? node : null; // 空スロットはフォルダとして扱わない
+    const leaf = isGroup(node) ? null : (node as Layer);
     const editing = editingLayerId === node.id;
-    const active = !grp && node.id === activeLayerId;
-    const disableDelete = previewing || leafCount() - collectLeafIds(node).length < 1;
-    const dropCls = dropHint?.id === slotId ? ` drop-${dropHint.pos}` : '';
-    // この行が「開いたスロットの中の1枚」なら、その親スタック（＝取り出し元）。
-    const inStack = stack ? undefined : getVariantStackOf(session.state, n.id);
-    const isShownVariant = inStack ? activeVariant(inStack)?.id === n.id : false;
+    const active = !isGroup(node) && node.id === activeLayerId;
+    // 「行として絵から外れている」かはスロット側（行）の性質。中身ごとの非表示は持たせないので、
+    // スロット行では stack.visible を見る（＝表示ボタンの効き先と一致させる）。
+    const rowHidden = stack ? !stack.visible || !node.visible : !node.visible;
+    // 上のボタン群が効く行。スロット行はスロット id でも中の差分 id でも選ばれたことにする
+    // （opTarget がスロット → 出ている差分へ解決するので、どちらで選んでも同じ行が対象になる）。
+    const selected = selectedId === slotId || selectedId === node.id;
+    // カルーセルを出すか。乗せている / スライド中 / ここへ落とそうとしている のいずれか。
+    // 縦一覧を廃止したので、横軸を見る手段はこれだけ（常に出すと行が高くなりすぎるので出し入れする）。
+    const swiping = !!stack && swipingStackId === stack.id;
+    const carouselOpen =
+      !!stack &&
+      (swiping ||
+        hoverStackId === stack.id ||
+        (!!dropHint && stack.children.some((c) => c.id === dropHint.id)));
+    /**
+     * まだ横軸を持たない行を「横へ持っていく」途中（＝これから初めて差分になる）。
+     * 差分が増えてからと同じ絵で見せたいので、コマ 1 枚だけの帯を出す。
+     * 「1 枚目はこの行、その左右どちらに入るか」がそのまま次の姿になる。
+     */
+    const besideDrop =
+      !stack &&
+      !!dragGhost &&
+      dropHint?.id === slotId &&
+      (dropHint.pos === 'left' || dropHint.pos === 'right');
+    // 帯に並べるコマ。スロットなら差分ぜんぶ、初めての差分化なら「その行」1 枚だけ。
+    const chips = stack ? stack.children : besideDrop ? [node] : null;
+    const showCarousel = stack ? carouselOpen : besideDrop;
+    /**
+     * 何かを持ち上げたままカルーセルに来ている＝差分として入れる操作の途中。
+     * このときは帯が行いっぱいに広がって並びを全部見せ、指しているコマの入る側に縁を出す
+     * （＝落とし先は「どのコマの、左か右か」）。
+     */
+    const dropMode = showCarousel && !!dragGhost;
+    // 落とし先の見せ方は 1 つに絞る。1 枚だけの帯が「どちら側に入るか」をコマの縁で見せている間は、
+    // 行の緑の縦棒（.drop-left/.drop-right）は出さない（同じことを 2 か所で言わない）。
+    const dropCls = dropHint?.id === slotId && !besideDrop ? ` drop-${dropHint.pos}` : '';
+    // 行のサムネイルの左右から覗かせる控え。いま出ている 1 枚の隣（＝スライドすれば次に来る 1 枚）
+    // なので、左右にドラッグしたときも覗きの中身がそのまま追従する。
+    const prevVariant = stack && shownIndex > 0 ? stack.children[shownIndex - 1] : null;
+    const nextVariant =
+      stack && shownIndex >= 0 && shownIndex < stack.children.length - 1
+        ? stack.children[shownIndex + 1]
+        : null;
     return (
       <li
         key={slotId}
+        // 入れ子の段付けは行に持たせる。ヘッダの padding だけでなく、帯（.variant-carousel）の
+        // 左端も段付けぶんずらす必要があるため（帯は ▾ とサムネイルを覆わない）。
+        style={{ '--depth': depth } as CSSProperties}
+        // カルーセルの出し入れは li で受ける（コマはヘッダの外にあるので、ヘッダで受けると
+        // 行 → コマへ指を移した瞬間に閉じてしまう）。持ち上げ中も開けて、落とし先を選ばせる。
+        //
+        // 乗った時点では出さず、【どこに乗っているか】で決める: 行そのものを扱う場所
+        // （⠿ / ▾ / サムネイル / 名前）に居る間は出さない。帯が出ていると、差分にした
+        // フォルダを開くことも、名前をダブルクリックで直すこともできなくなるため。
+        onPointerMove={
+          stack
+            ? (e) => {
+                // 掴んでいる間の開閉は onRowPointerMove が持つ（落とし先を選ばせるため開けたままにする）。
+                if (dragIdRef.current || swipeRef.current) return;
+                const el = e.target as HTMLElement;
+                // 開いたフォルダの中の行からも move は上がってくる。そこは【その行】の話なので、
+                // 親の帯は畳む（帯は自分の段しか覆っていないので、下の行に被ってもいない）。
+                const mine = el.closest?.('.layer-item') === e.currentTarget;
+                const own = !mine || !!el.closest?.(ROW_OWN_PARTS);
+                setHoverStackId((p) =>
+                  own ? (p === stack.id ? null : p) : p === stack.id ? p : stack.id,
+                );
+              }
+            : undefined
+        }
+        onPointerLeave={
+          stack
+            ? () => {
+                // スライド中は指が離れるまで開けたまま（capture 中に閉じると帯が消える）。
+                if (!swipeRef.current) setHoverStackId((p) => (p === stack.id ? null : p));
+                clearVariantPeek();
+              }
+            : undefined
+        }
         className={`layer-item ${grp ? 'is-group' : ''} ${active ? 'active' : ''}${
+          selected ? ' selected' : ''
+        }${rowHidden ? ' is-hidden' : ''}${emptySlot ? ' is-empty-slot' : ''}${
           leaf?.clipped ? ' is-clipped' : ''
         }${stack ? ' has-variants' : ''}${
-          variantPeek?.stackId === slotId ? ' peeking' : ''
-        }${inStack ? ' is-variant' : ''}${isShownVariant ? ' is-shown-variant' : ''}${
-          dragGhost?.id === slotId ? ' lifted' : ''
-        }${dropCls}`}
+          // 帯が開いている間の行。名前を沈めて帯に譲る（帯の左端で文字が切れて見えないように）。
+          showCarousel && !dropMode ? ' is-axis-open' : ''
+        }${
+          // 中身を開いているフォルダ行。行の箱が下へ伸びるので、行の上に重ねている帯は
+          // 自分の段で止める必要がある（CSS 側で高さを詰める）。
+          grp && !isCollapsed(grp) ? ' is-open' : ''
+        }${dragGhost?.id === slotId ? ' lifted' : ''}${dropCls}`}
       >
         <div
-          className="layer-head"
+          // 名前を書き換えている間だけ、左の組を自然幅に戻して入力欄に幅を回す
+          // （中央合わせのために左が右と同じ幅まで伸びているぶん、入力欄が狭くなるため）。
+          className={`layer-head${editing ? ' is-editing' : ''}`}
           data-id={slotId}
-          style={{ paddingLeft: 4 + depth * 12 }}
+          // 入れ子の段付けは CSS 側で計算する（両端の覗きぶんの余白も足す必要があり、
+          // インラインで padding を決め打ちすると CSS 側から足せなくなるため）。
+          // --depth は行(li)に置いてあり、ここへは継承で降りてくる。
           onPointerDown={(e) => onRowPointerDown(n, e)}
           onPointerMove={onRowPointerMove}
           onPointerUp={onRowPointerUp}
           onPointerCancel={onRowPointerUp}
+          // 行のどこを押しても選べる（行からボタンを外したぶん、当たり判定を行全体に広げる）。
+          // スライド／移動の直後に届く click は選択として扱わない（gestureConsumedRef のコメント参照）。
+          onClick={() => {
+            if (gestureConsumedRef.current) return;
+            onLayerClick(node);
+          }}
           // 長押し中にコンテキストメニューが割り込むと持ち上げが中断されるので抑止する。
           onContextMenu={(e) => e.preventDefault()}
-          // 開いた一覧の差分行も、サムネイル帯と同じくホバーで確認・クリックで確定にする。
-          onPointerEnter={
-            inStack ? () => peekVariant(inStack, inStack.children.indexOf(n)) : undefined
-          }
-          onPointerLeave={inStack ? clearVariantPeek : undefined}
         >
-          <span
-            className="layer-grip"
-            title={
-              stack
-                ? 'ここを掴むとすぐ持ち上がる（移動）／行を左右にドラッグ＝差分の切り替え／長押しでも持ち上がる'
-                : 'ここを掴むとすぐ持ち上がる（移動）／行は長押しで持ち上がる'
-            }
-          >
-            {stack ? '⇹' : '⠿'}
-          </span>
-          {/* 開閉の枠は 1 つだけ（行が横に伸びると名前が潰れるため）。
-              スロット行はスロットの開閉を優先する: 開くと中の差分が縦に並び、
-              1 枚ずつ掴んで外へ出せる（＝横軸の分解）。 */}
-          {stack ? (
-            <button
-              className="icon-btn"
+          {/* 行の組み: [⠿ ▾] [名前] [横軸] [印]。名前と印の 2 つを同じ幅で伸ばすので、
+              あいだに挟まる横軸はどの行でも同じ位置に立ち、リストを縦に流し見したときに
+              サムネイルが 1 本の線に揃う（＝その線が「いま出ている絵」の列になる）。 */}
+          <span className="lh-left">
+            <span
+              className="layer-grip"
               title={
-                stack.collapsed
-                  ? `差分 ${stack.children.length} 枚を開く（1 枚ずつ掴んで外へ出せます）`
-                  : '差分を畳む'
+                stack
+                  ? 'ここを掴むとすぐ持ち上がる（移動）／行を左右にドラッグ＝差分の切り替え／長押しでも持ち上がる'
+                  : 'ここを掴むとすぐ持ち上がる（移動）／行は長押しで持ち上がる'
               }
-              onClick={() => toggleCollapse(stack)}
             >
-              {stack.collapsed ? '▸' : '▾'}
-            </button>
-          ) : grp ? (
-            <button
-              className="icon-btn"
-              title={grp.collapsed ? '展開' : '折りたたみ'}
-              onClick={() => toggleCollapse(grp)}
-            >
-              {grp.collapsed ? '▸' : '▾'}
-            </button>
-          ) : inStack ? null : (
-            <span className="layer-indent" />
-          )}
-          {/* 差分行では表示/非表示を出さない。控えの差分はそもそも絵に載らず、出ている 1 枚の
-              表示切替はスロット行が持っているため（同じ操作を二重に置くと名前の幅が無くなる）。 */}
-          {!inStack && (
-            <button
-              className="icon-btn"
-              title={node.visible ? '表示中（クリックで非表示）' : '非表示（クリックで表示）'}
-              disabled={previewing}
-              onClick={() => toggleVisibility(node)}
-            >
-              {node.visible ? '👁' : '🚫'}
-            </button>
-          )}
-          <img
-            className="layer-thumb"
-            src={layerThumb(node)}
-            alt=""
-            draggable={false}
-            title="レイヤーの内容"
-          />
+              ⠿
+            </span>
+            {/* 開閉はフォルダ（縦軸）だけ。スロット（横軸）に開閉は無い:
+                開くと中の差分が縦に並ぶ、という以前の作りは「横軸なのに縦に出る」ので廃止した。
+                横に並んでいるものは横に並べて見せる ＝ カルーセルがその役目を全部持つ。 */}
+            {grp ? (
+              <button
+                className="icon-btn"
+                title={isCollapsed(grp) ? '展開' : '折りたたみ'}
+                onClick={() => toggleCollapse(grp)}
+              >
+                {isCollapsed(grp) ? '▸' : '▾'}
+              </button>
+            ) : (
+              <span className="layer-indent" />
+            )}
+          </span>
           {editing ? (
             <input
               className="layer-name-input"
@@ -3063,15 +3872,14 @@ export function CanvasEditor({
           ) : (
             <span
               className="layer-name"
-              onClick={() => onLayerClick(node)}
-              onDoubleClick={() => startRename(node)}
+              onDoubleClick={emptySlot ? undefined : () => startRename(node)}
               title={
-                inStack && !isShownVariant
-                  ? 'クリックでこの差分をスロットに出す / ダブルクリックで名称変更'
-                  : 'クリックで選択/開閉 / ダブルクリックで名称変更'
+                emptySlot
+                  ? 'この行が「何も無い」を選んでいる状態（名前は付けません）'
+                  : 'クリックで選択（上のボタンの効き先になる）/ ダブルクリックで名称変更'
               }
             >
-              {grp ? '📁 ' : ''}
+              {/* 「フォルダである」はサムネイルの形（タブ付き）が言うので、名前には付けない。 */}
               {node.name}
               {leaf && (leaf.offsetX !== 0 || leaf.offsetY !== 0) && (
                 <span className="muted">
@@ -3081,99 +3889,187 @@ export function CanvasEditor({
               )}
             </span>
           )}
-          <span className="layer-actions">
+          {/* 行の横軸。いま出ている 1 枚を置き、その左右に控えの差分を薄く覗かせる
+              （＝「この行は横に並んでいる」を、行を見ただけで言い切る）。
+              以前ここを担っていた二重枠（.slot-frame）は廃止した: 枠は「何かある」までしか
+              言えず、何が・どちら側に・いくつあるかは覗いたサムネイルの方が正確に伝わる。
+              カルーセルはこの位置を中心に開くので、開いてもいま出ている 1 枚は動かない。 */}
+          <span className="layer-axis">
+            {prevVariant && renderAxisPeek(prevVariant, 'prev')}
+            {emptySlot ? (
+              // 空スロットは中身が無いので、サムネイルの代わりに「無い」ことを描く枠を置く
+              // （画素が無いだけの真っ白なサムネイルと見分けが付かなくなるのを避ける）。
+              <span className="layer-thumb is-empty" title="何も無い（この行は絵に出ません）" />
+            ) : (
+              <img
+                // フォルダはサムネイルの形自体をタブ付き（フォルダの形）にする。名前の 📁 は
+                // 廃止した: 同じことを字と形の 2 か所で言わない＆名前の幅もそのぶん空く。
+                className={`layer-thumb${grp ? ' is-folder' : ''}`}
+                src={layerThumb(node)}
+                alt=""
+                draggable={false}
+                title={
+                  stack
+                    ? `${grp ? 'フォルダ／' : ''}いま出ている差分（左右の薄いサムネイルが控え）／乗せると横軸が開きます`
+                    : grp
+                      ? 'フォルダの中身（まとめて出ています）'
+                      : 'レイヤーの内容'
+                }
+              />
+            )}
+            {nextVariant && renderAxisPeek(nextVariant, 'next')}
+          </span>
+          <span className="lh-right">
+            <span className="layer-actions">
             {stack && (
               // 「横に何枚あって、いま何枚目か」だけを小さく出す。実際の選択はスライド（カルーセル）で行う。
               <span
                 className="variant-count"
-                title={`差分 ${stack.children.length} 枚。行を左右にドラッグして切り替え（帯が指について動きます）`}
+                title={`差分 ${stack.children.length} 枚。サムネイルに乗せるとカルーセルが出ます（左右にドラッグで切り替え）`}
               >
                 {shownIndex + 1}/{stack.children.length}
               </span>
             )}
-            {isShownVariant && (
-              // 開いたスロットのうち、いま絵に載っている 1 枚の印。控え側は行を薄くして示すので
-              // 印を出さない（行が横に伸びると名前の幅が無くなるため、目印は最小限にする）。
-              <span className="variant-badge on" title="いまこのスロットに出ている差分" />
+            {active && (
+              // 描き先の印。選択（青枠）と描き先は別物なので、青枠ではなくこの印で示す
+              // （フォルダを選んでいる間、筆がどこに乗るのかはこれで追える）。
+              <span
+                className="layer-flag is-draw-flag"
+                title="描き先（筆・消しゴム・塗りはこの行に効きます）"
+              >
+                描
+              </span>
             )}
-            {leaf && (
-              <button
-                className={`icon-btn${leaf.clipped ? ' on' : ''}`}
+            {/* 状態の印（押せない・ただの表示）。操作ボタンは全部パネル上部にあるので、行に残すのは
+                「いまこの行がどうなっているか」だけ。押せる小物を行から無くしておくことで、
+                行そのものを別の見せ方（差分どうしの関係の図示など）に使えるようにしている。 */}
+            {rowHidden && (
+              // 「行ごと絵から外れている」印。中身ごとの非表示は持たせないので、スロット行では
+              // スロット側の非表示を示す（＝上の表示ボタンの効き先と一致する）。
+              <span
+                className="layer-flag is-hidden-flag"
                 title={
-                  canClip(leaf)
-                    ? '下のレイヤーにクリップ (clipping mask)'
-                    : '直下にレイヤーが無いためクリップできません'
+                  stack
+                    ? 'この行ごと非表示（一時的。全状態に効きます。「この状態では出さない」は空スロットで表します）'
+                    : '非表示（絵に出ていない）'
                 }
-                disabled={previewing || (!leaf.clipped && !canClip(leaf))}
-                onClick={() => toggleClip(leaf)}
               >
+                非
+              </span>
+            )}
+            {node.blendMode === 'multiply' && (
+              <span className="layer-flag is-mul-flag" title="乗算で合成中（下の色に掛かる）">
+                乗
+              </span>
+            )}
+            {leaf?.clipped && (
+              <span className="layer-flag is-clip-flag" title="下のレイヤーにクリップ中">
                 ⤵
-              </button>
+              </span>
             )}
-            {/* 差分どうしは「別の可能性」であって上下関係が無いので統合できない（canMergeDown が
-                常に false）。スロット行・差分行では押せないボタンを置かず、幅を名前に回す。 */}
-            {!grp && !inStack && !stack && (
-              <button
-                className="icon-btn"
-                title="下のレイヤーと統合 (merge down)"
-                disabled={previewing || !canMergeDown(node)}
-                onClick={() => mergeDown(node)}
-              >
-                ⤓
-              </button>
-            )}
-            <button
-              className="icon-btn"
-              title={stack || inStack ? 'この差分を削除（残り1つになったら横軸は解除）' : '削除'}
-              disabled={disableDelete}
-              onClick={() =>
-                stack
-                  ? removeVariant(stack, node)
-                  : inStack
-                    ? removeVariant(inStack, n)
-                    : deleteLayer(node)
-              }
-            >
-              🗑
-            </button>
+            </span>
           </span>
         </div>
-        {/* 左右スライド中だけ出るカルーセル。行の上に重ねるので（position:absolute）
-            レイアウトはびくとも動かず、指の動きにサムネイルがそのまま付いてくる。
-            中央の枠に来ている 1 枚がキャンバスにも出ていて、離すとそれで確定する。
-            「何段ドラッグすれば隣へ行くか」が絵で見えるので、見えない数え上げにならない。 */}
-        {stack && swipingStackId === stack.id && (
-          <div className="variant-carousel">
+        {/* 行に乗せている間・左右スライド中・差分として落とそうとしている間に出るカルーセル。
+            行の上に重ねるので（position:absolute）レイアウトはびくとも動かず、指の動きに
+            サムネイルがそのまま付いてくる。中央の枠に来ている 1 枚がキャンバスにも出ていて、
+            離すとそれで確定する。
+            まだ差分の無い行を横へ持っていくときも【コマ 1 枚の同じ帯】が出る。初めての 1 枚も
+            2 枚目以降も同じ絵・同じ落とし方になるので、差分づくりに別の作法を覚えなくて済む。 */}
+        {chips && showCarousel && (
+          <div
+            // 差分を受け入れている間は行いっぱいに広がる（CSS .is-dropping）。落とし先を選ぶ場面では
+            // ⠿ も ▾ も押さない（指はもう塞がっている）ので、覆わない約束を守る必要がない。
+            className={`variant-carousel${dropMode ? ' is-dropping' : ''}`}
+            title={
+              stack && !dropMode
+                ? 'コマ以外のところを掴んで左右に引くと差分が流れます（離したところで確定）'
+                : undefined
+            }
+            // 帯の地（コマの載っていないところ）＝横軸を引っ張る面。コマ側は伝播を止めるので、
+            // ここに来る pointerdown は必ず「地を押した」ことになる。
+            onPointerDown={
+              stack && !dropMode ? (e) => onPullPointerDown(stack, e) : undefined
+            }
+            // コマの移動/離しもここまで上がってくる（コマ側では受けない＝二重処理を作らない）。
+            onPointerMove={onRowPointerMove}
+            onPointerUp={onRowPointerUp}
+            onPointerCancel={onRowPointerUp}
+            // 引かずに離した＝ただのクリックなら行の選択。カルーセルが行を覆っているぶん、
+            // 「行を選ぶ」手段をここでも受けておく（⠿・▾ は覆っていない）。
+            onClick={() => {
+              if (!gestureConsumedRef.current) onLayerClick(node);
+            }}
+          >
+            {/* 帯の両端のぼかし。コマがここへ滑り込んで地の色に溶ける＝「まだ続きがある」の絵。
+                掴む役はこれではなく帯そのもの（＝コマ以外の全部）が持つので、素通しにしてある。 */}
+            {stack && !dropMode && (
+              <>
+                <span className="vc-fade is-left" aria-hidden="true" />
+                <span className="vc-fade is-right" aria-hidden="true" />
+              </>
+            )}
+            {/* コマが流れる窓。帯からはみ出したコマはここで切られる。 */}
+            <div className="vc-window">
             <div
-              className="vc-track"
-              ref={carouselTrackRef}
-              style={{
-                transform: carouselTransform(swipeRef.current ?? { baseIndex: shownIndex, dx: 0 }),
-              }}
+              className={`vc-track${dropMode ? ' dropping' : ''}`}
+              ref={swiping ? carouselTrackRef : undefined}
+              style={
+                dropMode
+                  ? undefined // 受け入れ中の位置決めは CSS 側（中央寄せ）に任せる
+                  : {
+                      transform: carouselTransform(
+                        swipeRef.current ?? { baseIndex: shownIndex, dx: 0 },
+                      ),
+                    }
+              }
             >
-              {stack.children.map((c, i) => (
-                <span key={c.id} className={`vc-chip${i === shownIndex ? ' on' : ''}`}>
-                  <img src={layerThumb(c)} alt="" draggable={false} />
-                </span>
+              {chips.map((c, i) => (
+                  <span
+                    key={c.id}
+                    className={`vc-chip${i === shownIndex ? ' on' : ''}${
+                      isEmptySlot(c) ? ' is-empty' : ''
+                    }${
+                      // フォルダの差分は角ではなくタブ付きの形にする（下の .is-folder 参照）。
+                      isGroup(c) && !isEmptySlot(c) ? ' is-folder' : ''
+                    }${dragGhost?.id === c.id ? ' lifted' : ''}${
+                      // ここへ落ちる、をコマの縁 1 本で示す（間に箱を挟まないので並びは動かない）。
+                      dropMode && dropHint?.id === c.id ? ` drop-${dropHint.pos}` : ''
+                    }`}
+                    data-id={c.id}
+                    title={
+                      stack
+                        ? `${isGroup(c) && !isEmptySlot(c) ? '📁 ' : ''}${c.name}（${i + 1}/${chips.length}）／クリックでこの差分に切り替え／掴んで動かすと並べ替え・外へ出せば取り出し`
+                        : `${c.name}（この行。左右どちらの隣に入れるかを選びます）`
+                    }
+                    // 掴んだ後の move/up は帯（親）が受ける。ここで二重に受けない。
+                    onPointerDown={stack ? (e) => onChipPointerDown(c, e) : undefined}
+                    // 乗せただけでは絵を差し替えない（覗き見の廃止。理由は peekVariant のコメント）。
+                    onClick={(e) => {
+                      e.stopPropagation(); // 行の選択にはしない（押した意味は「この差分にする」）
+                      if (stack && !gestureConsumedRef.current) chooseVariant(stack, i);
+                    }}
+                  >
+                    {isEmptySlot(c) ? (
+                      <span className="vc-empty" />
+                    ) : (
+                      <img src={layerThumb(c)} alt="" draggable={false} />
+                    )}
+                  </span>
               ))}
             </div>
-            <div className="vc-frame" />
+            </div>
+            {/* 中央の固定枠は「いま絵に出ているのはこれ」の印。受け入れ中は
+                「どこに入るか」の方が主役なので出さない。 */}
+            {!dropMode && <div className="vc-frame" />}
             <span className="vc-label">
-              {shownIndex + 1}/{stack.children.length} {stack.children[shownIndex]?.name ?? ''}
+              {dropMode
+                ? '差分として入れる位置'
+                : `${shownIndex + 1}/${chips.length} ${chips[shownIndex]?.name ?? ''}`}
             </span>
           </div>
         )}
-        {/* 開いたスロットの中身。左→右の並びをそのまま上→下に出す（帯の並びと一致させる）。
-            各行は普通のレイヤー行なので、掴んで外へドラッグすればスロットから出せる＝分解になる。 */}
-        {stack && !stack.collapsed && (
-          <ul className="layer-list nested variants">
-            <li className="variant-list-cap">
-              横に並ぶ差分（この中の 1 枚だけが絵に載ります）— 掴んで外へ出すと普通のレイヤーに戻ります
-            </li>
-            {stack.children.map((c) => renderNode(c, depth + 1, stack.children))}
-          </ul>
-        )}
-        {grp && !grp.collapsed && (
+        {grp && !isCollapsed(grp) && (
           <ul className="layer-list nested">
             {grp.children
               .slice()
@@ -3182,6 +4078,154 @@ export function CanvasEditor({
           </ul>
         )}
       </li>
+    );
+  };
+
+  /**
+   * 行 × 状態 の交点に打つ印。押すと所属が付いたり外れたりする（ここが唯一の所属の作り口）。
+   * 素通り（スロットが 1 つの行）には何も置かない ＝ 操作も宣言も要らないことが、
+   * 何も足さない見た目に対応する。
+   */
+  const renderRailMark = (
+    st: VariantState,
+    x: number,
+    color: string,
+    row: { id: string; y: number; h: number },
+    cell: RailCell,
+  ) => {
+    if (cell === 'pass') return null;
+    // 指せるのは「行の中のスロット」だけ。ここが null の行（選ばれていないスロットの中身など）は
+    // 所属の宛先になれないので、印も当たり判定も出さない。
+    const t = attachTarget(session.state, row.id);
+    if (!t) return null;
+    const slotName = getNode(session.state, t.slotId)?.name ?? '';
+    const cy = row.y + row.h / 2;
+    // その印が指しているスロット（畳んだ行なら所属先、開いた行ならその行自身）が空スロットか。
+    // 「ここに中身を置く」と「ここは何も出さない」は関係としては同格なので、印の形で区別する
+    // （丸＝中身がある / 横棒＝空）。ver1 が 4 行のうち 1 行では「無し」を選んでいる、が一目で読める。
+    const att = liveAttachment(session.state, st.id, t.stack.id);
+    const markSlotId = cell === 'dot' ? row.id : att?.slotId;
+    const markEmpty = !!markSlotId && isEmptySlot(getNode(session.state, markSlotId) ?? t.stack);
+    const kindWord = markEmpty ? '「何も無い」' : `「${slotName}」`;
+    const label =
+      cell === 'knobOn'
+        ? `${st.name}：この行では${kindWord}（いま出ているもの）。押すと外す`
+        : cell === 'knobOff'
+          ? `${st.name}：この行では${kindWord}を使うのに、別のものが出ている（ズレ）。押すと「${slotName}」に付け替える`
+          : cell === 'dot'
+            ? `${st.name}：${markEmpty ? 'この行では何も出さない' : 'このスロットに所属'}。押すと外す`
+            : `${st.name}：この行ではどのスロットも選んでいない。押すと${
+                isEmptySlot(getNode(session.state, t.slotId) ?? t.stack)
+                  ? '「何も出さない」'
+                  : `「${slotName}」`
+              }にくっつける`;
+    return (
+      <g
+        key={`${st.id}:${row.id}`}
+        className="rail-hit"
+        onClick={() => toggleAttachment(st.id, row.id)}
+      >
+        <title>{label}</title>
+        {/* 指でも押せる当たり判定（見えない）。印そのものは小さくしておきたいので分ける。 */}
+        <circle className="rail-hit-area" cx={x} cy={cy} r={9} />
+        {cell === 'knobOn' &&
+          (markEmpty ? (
+            <line
+              className="rail-dash"
+              x1={x - RAIL_KNOB_R}
+              y1={cy}
+              x2={x + RAIL_KNOB_R}
+              y2={cy}
+              stroke={color}
+            />
+          ) : (
+            <circle cx={x} cy={cy} r={RAIL_KNOB_R} fill={color} />
+          ))}
+        {cell === 'knobOff' &&
+          (markEmpty ? (
+            <line
+              className="rail-dash off"
+              x1={x - RAIL_KNOB_R}
+              y1={cy}
+              x2={x + RAIL_KNOB_R}
+              y2={cy}
+              stroke={color}
+            />
+          ) : (
+            <circle className="rail-knob-off" cx={x} cy={cy} r={RAIL_KNOB_R} stroke={color} />
+          ))}
+        {cell === 'dot' &&
+          (markEmpty ? (
+            <line
+              className="rail-dash"
+              x1={x - RAIL_DOT_R - 1}
+              y1={cy}
+              x2={x + RAIL_DOT_R + 1}
+              y2={cy}
+              stroke={color}
+            />
+          ) : (
+            <circle cx={x} cy={cy} r={RAIL_DOT_R} fill={color} />
+          ))}
+        {cell === 'gap' && (
+          <circle className="rail-open" cx={x} cy={cy} r={RAIL_KNOB_R - 1} stroke={color} />
+        )}
+      </g>
+    );
+  };
+
+  /**
+   * 状態のレール。状態ごとに 1 本の縦線をリストの左に立て、行との交点に印を打つ。
+   *
+   * 点と点を総当たりで結ぶ（ノードグラフ）のを避けて 1 本に束ねているのは 3 つの理由から:
+   *   1. 状態そのものが「押せる対象」になる（上の名札がレールの頭）。線だけでは選ぶ先が無い。
+   *   2. 「所属していない」が**線の途切れ**として見える。線が無いことは背景と区別できないので、
+   *      メッシュだと「自動共有されている」と「どれも選んでいない」が同じ見た目になってしまう。
+   *   3. レイヤーの縦順は合成順なので動かせない。総当たりの線は交差しっぱなしになる。
+   *
+   * 素通り（スロットが 1 つの行）は線が通るだけで印は無い。規則3「宣言も操作も要らない」が
+   * そのまま「何も足さない見た目」に対応する。
+   */
+  const renderStateRails = (states: readonly VariantState[]) => {
+    if (states.length === 0 || railRows.length === 0) return null;
+    return (
+      <svg className="rail-svg">
+        {states.map((st, si) => {
+          const x = RAIL_PAD_L + si * RAIL_PITCH;
+          const color = railColor(si);
+          const cells = railRows.map((r) => railCell(session.state, st.id, r.id));
+          // 途切れていない区間だけを線にする。1 区間は「最初の行の上端から最後の行の下端まで」の
+          // 1 本なので、行の間に挟まる見出し（差分一覧のキャプション等）も自然に跨げる。
+          const segs: { y1: number; y2: number }[] = [];
+          let from = -1;
+          for (let i = 0; i <= railRows.length; i++) {
+            const on = i < railRows.length && cells[i] !== 'gap';
+            if (on && from < 0) from = i;
+            if (!on && from >= 0) {
+              const a = railRows[from];
+              const b = railRows[i - 1];
+              segs.push({ y1: a.y - RAIL_BRIDGE, y2: b.y + b.h + RAIL_BRIDGE });
+              from = -1;
+            }
+          }
+          return (
+            <g key={st.id}>
+              {segs.map((s, i) => (
+                <line
+                  className="rail-line"
+                  key={i}
+                  x1={x}
+                  y1={s.y1}
+                  x2={x}
+                  y2={s.y2}
+                  stroke={color}
+                />
+              ))}
+              {railRows.map((r, i) => renderRailMark(st, x, color, r, cells[i]))}
+            </g>
+          );
+        })}
+      </svg>
     );
   };
 
@@ -3196,6 +4240,13 @@ export function CanvasEditor({
   };
 
   const log = session.getLog();
+
+  // 状態の一覧と、レールを引くために左に空ける幅。状態が 0 本なら幅も 0 で、
+  // 状態を作っていないうちはレイヤーパネルの見た目が今までとまったく変わらない。
+  const stateList = listStates(session.state);
+  const railGutterW = stateList.length
+    ? RAIL_PAD_L + (stateList.length - 1) * RAIL_PITCH + RAIL_KNOB_R + RAIL_PAD_R
+    : 0;
 
   const onScrub = (k: number) => {
     if (k >= log.length) {
@@ -3245,45 +4296,47 @@ export function CanvasEditor({
         <div
           ref={stageRef}
           className="canvas-stage"
-          style={{ transform: `translate(${panRef.current.x}px, ${panRef.current.y}px)` }}
+          style={{
+            transform: `translate(${panRef.current.x}px, ${panRef.current.y}px)`,
+          }}
         >
           <div className="canvas-pan" style={{ transform: `scale(${zoom})` }}>
-          {/* アートボード（最終画像になる矩形）。ライブ canvas をここに置く。白い紙が「枠の中」。 */}
-          <div className="board-tile-host focused" style={{ left: focusX, top: focusY }}>
-            <canvas
-              ref={canvasRef}
-              className="edit-canvas"
-              width={width}
-              height={height}
-              style={{
-                width,
-                height,
-                touchAction: 'none',
-                cursor: showCursor ? 'none' : 'crosshair',
-                imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
-              }}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={onPointerUp}
-              onContextMenu={(e) => e.preventDefault()} // 右ボタンはスポイトに使うのでメニューを出さない
-              onPointerEnter={(e) => {
-                setHovering(true);
-                moveCursor(e.clientX, e.clientY);
-              }}
-              onPointerLeave={() => setHovering(false)}
-            />
-            {/* 選択範囲の点線と投げ縄ドラッグを描く重ね canvas。絵の canvas を汚さないので、
+            {/* アートボード（最終画像になる矩形）。ライブ canvas をここに置く。白い紙が「枠の中」。 */}
+            <div className="board-tile-host focused" style={{ left: focusX, top: focusY }}>
+              <canvas
+                ref={canvasRef}
+                className="edit-canvas"
+                width={width}
+                height={height}
+                style={{
+                  width,
+                  height,
+                  touchAction: 'none',
+                  cursor: showCursor ? 'none' : 'crosshair',
+                  imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
+                }}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerUp}
+                onContextMenu={(e) => e.preventDefault()} // 右ボタンはスポイトに使うのでメニューを出さない
+                onPointerEnter={(e) => {
+                  setHovering(true);
+                  moveCursor(e.clientX, e.clientY);
+                }}
+                onPointerLeave={() => setHovering(false)}
+              />
+              {/* 選択範囲の点線と投げ縄ドラッグを描く重ね canvas。絵の canvas を汚さないので、
                 点線を動かしても投げ縄を引いてもレイヤー合成をやり直さずに済む（当たり判定は持たない）。 */}
-            <canvas
-              ref={selCanvasRef}
-              className="selection-overlay"
-              width={width}
-              height={height}
-              style={{ width, height }}
-            />
+              <canvas
+                ref={selCanvasRef}
+                className="selection-overlay"
+                width={width}
+                height={height}
+                style={{ width, height }}
+              />
+            </div>
           </div>
-        </div>
           {/* リサイズ・ドラッグ中に出す破線プレビュー枠（アートボード原点 0,0 起点）。大きさは命令的に更新。 */}
           <div ref={resizeOutlineRef} className="resize-outline" style={{ display: 'none' }} />
 
@@ -3334,7 +4387,11 @@ export function CanvasEditor({
 
       {/* レイヤー D&D 中に pointer へ追従する半透明ゴースト（マウス/ペン/タッチ共通）。
           行の左右の肩に来ているときは「差分になる」ことをその場で言葉でも示す。 */}
-      <div ref={ghostRef} className="layer-drag-ghost" style={{ display: dragGhost ? 'block' : 'none' }}>
+      <div
+        ref={ghostRef}
+        className="layer-drag-ghost"
+        style={{ display: dragGhost ? 'block' : 'none' }}
+      >
         {dragGhost?.name}
         {(dropHint?.pos === 'left' || dropHint?.pos === 'right') && (
           <span className="drag-ghost-badge">
@@ -3352,17 +4409,27 @@ export function CanvasEditor({
 
       {/* キャンバス下部のフロートバー: ズーム + 履歴スクラブ */}
       <div className="float-canvasbar">
-        <button onClick={() => zoomByCenter(1 / 1.25)} title="縮小">−</button>
+        <button onClick={() => zoomByCenter(1 / 1.25)} title="縮小">
+          −
+        </button>
         <span className="zoom-val" onClick={resetZoom} title="クリックで100%">
           {Math.round(zoom * 100)}%
         </span>
-        <button onClick={() => zoomByCenter(1.25)} title="拡大">＋</button>
+        <button onClick={() => zoomByCenter(1.25)} title="拡大">
+          ＋
+        </button>
         <button onClick={resetZoom}>100%</button>
         <button onClick={fitZoom}>Fit</button>
-        <span className={`keyhint-badge ${zoomKey ? 'on' : ''}`} title="Z を押しながらキャンバスを上下ドラッグでズーム">
+        <span
+          className={`keyhint-badge ${zoomKey ? 'on' : ''}`}
+          title="Z を押しながらキャンバスを上下ドラッグでズーム"
+        >
           Z＋上下ドラッグ＝ズーム
         </span>
-        <span className={`keyhint-badge ${spaceHeld ? 'on' : ''}`} title="Space を押しながらドラッグで視点移動">
+        <span
+          className={`keyhint-badge ${spaceHeld ? 'on' : ''}`}
+          title="Space を押しながらドラッグで視点移動"
+        >
           Space＝視点移動
         </span>
         <span className="cb-sep" />
@@ -3380,10 +4447,19 @@ export function CanvasEditor({
         </span>
       </div>
 
-      <FloatWindow id="nrc-tools" title="Tools" defaultPos={{ left: 12, top: 12 }} className="float-tools">
+      <FloatWindow
+        id="nrc-tools"
+        title="Tools"
+        defaultPos={{ left: 12, top: 12 }}
+        className="float-tools"
+      >
         <Section title="TOOLS" defaultOpen>
           <div className="tool-row">
-            <button onClick={doUndo} disabled={!session.canUndo() || previewing} title="Undo (Ctrl+Z)">
+            <button
+              onClick={doUndo}
+              disabled={!session.canUndo() || previewing}
+              title="Undo (Ctrl+Z)"
+            >
               <ToolIcon name="undo" size={15} /> Undo
             </button>
             <button
@@ -3424,7 +4500,8 @@ export function CanvasEditor({
             <div className="selection-bar">
               <ToolIcon name="lassoSelect" size={14} />
               <span className="selection-bar-text">
-                選択中 {selectionInfo.w}×{selectionInfo.h}（{selectionInfo.area.toLocaleString()}px）
+                選択中 {selectionInfo.w}×{selectionInfo.h}（{selectionInfo.area.toLocaleString()}
+                px）
               </span>
               <button
                 className="icon-btn"
@@ -3492,10 +4569,10 @@ export function CanvasEditor({
             </p>
           )}
           <p className="hint">
-            B=ブラシ N=Gペン P=鉛筆 A=エア E=消しゴム G=塗りつぶし U=投げ縄塗り I=スポイト
-            L=直線 R=矩形 M=投げ縄選択 V=変形 Q=履歴しらべ／
-            S押下＋上下ドラッグ or [ ]=サイズ／X=メイン⇄サブ C=透明／, .=差分の切替／
-            Ctrl+Z=Undo Ctrl+Shift+Z=Redo Ctrl+D=選択解除
+            B=ブラシ N=Gペン P=鉛筆 A=エア E=消しゴム G=塗りつぶし U=投げ縄塗り I=スポイト L=直線
+            R=矩形 M=投げ縄選択 V=変形 Q=履歴しらべ／ S押下＋上下ドラッグ or [
+            ]=サイズ／X=メイン⇄サブ C=透明／, .=差分の切替／ Ctrl+Z=Undo Ctrl+Shift+Z=Redo
+            Ctrl+D=選択解除
           </p>
 
           {/* ツールプロパティ: いま選んでいる筆の質感を直接いじる。値は描いた op に焼き込まれるので、
@@ -3520,7 +4597,11 @@ export function CanvasEditor({
                   // ぼかし>0 のときは減衰曲線が縁を決めるので「縁の締まり」は効かない。
                   const disabled = f.key === 'edge' && brushSet.soft > 0;
                   return (
-                    <label className={`field tool-prop${disabled ? ' off' : ''}`} key={f.key} title={f.hint}>
+                    <label
+                      className={`field tool-prop${disabled ? ' off' : ''}`}
+                      key={f.key}
+                      title={f.hint}
+                    >
                       <span>
                         {f.label} {brushSet[f.key]}
                       </span>
@@ -3551,7 +4632,10 @@ export function CanvasEditor({
 
         <Section title="CANVAS" defaultOpen={false}>
           <div className="canvas-size-current">
-            現在: <b>{width}×{height}</b>{' '}
+            現在:{' '}
+            <b>
+              {width}×{height}
+            </b>{' '}
             <span className="muted">({((width * height) / 1_000_000).toFixed(1)} MP)</span>
           </div>
           <div className="canvas-size-row">
@@ -3574,7 +4658,11 @@ export function CanvasEditor({
               onKeyDown={(e) => e.key === 'Enter' && applyCanvasSize()}
               title="高さ (px)"
             />
-            <button onClick={applyCanvasSize} disabled={previewing} title="このサイズに変更（内容は保持）">
+            <button
+              onClick={applyCanvasSize}
+              disabled={previewing}
+              title="このサイズに変更（内容は保持）"
+            >
               Apply
             </button>
           </div>
@@ -3597,8 +4685,8 @@ export function CanvasEditor({
           </div>
           <p className="hint">
             サイズ変更は非破壊（内容は保持。縮小=枠外に隠れ、拡大=再び現れる）。キャンバス右辺・下辺の
-            ハンドルを掴んで引っ張っても変えられます。上限 {MAX_CANVAS_DIM}px/辺。高解像度ほどメモリを
-            食います（1レイヤ ≈ 幅×高さ×4 byte。例: 8192² ≈ 256MB/枚）。
+            ハンドルを掴んで引っ張っても変えられます。上限 {MAX_CANVAS_DIM}
+            px/辺。高解像度ほどメモリを 食います（1レイヤ ≈ 幅×高さ×4 byte。例: 8192² ≈ 256MB/枚）。
           </p>
         </Section>
 
@@ -3634,7 +4722,10 @@ export function CanvasEditor({
           </div>
           <p className="hint">
             X=メイン⇄サブ／C=透明⇄色。透明は
-            {transparentInk ? `いま有効（${toolLabel}がその質感のまま消しゴムになります）` : '色ではなく透過を塗ります'}。
+            {transparentInk
+              ? `いま有効（${toolLabel}がその質感のまま消しゴムになります）`
+              : '色ではなく透過を塗ります'}
+            。
           </p>
           {/* ピッカーが編集するのは「いま選んでいる色枠」。透明を選んだまま色を触ったら色枠へ戻す。 */}
           <ColorPicker color={color} onChange={setColor} />
@@ -3680,8 +4771,8 @@ export function CanvasEditor({
             </button>
           </div>
           <p className="hint">
-            ワンクリック変形（アクティブレイヤー、中心基準）。自由な移動・拡大縮小・回転は
-            Transform ツール（V）でキャンバス上の枠をドラッグ。
+            ワンクリック変形（アクティブレイヤー、中心基準）。自由な移動・拡大縮小・回転は Transform
+            ツール（V）でキャンバス上の枠をドラッグ。
           </p>
         </Section>
 
@@ -3720,79 +4811,185 @@ export function CanvasEditor({
         className="float-layers"
       >
         <Section title="LAYERS" defaultOpen>
-          {/* レイヤー操作。どれもアクティブレイヤー（＝いま描いている1枚）に効く。
-              各行にも同じ操作のボタンはあるが、行のボタンは幅の都合で最小限しか置けないので、
-              よく使うものはここに揃えて「いまの1枚に何ができるか」を一望できるようにする。 */}
-          <div className="tool-group-label">レイヤー操作</div>
+          {/* 作る操作。落とし所は「最上位」または「選んでいる行の隣」で、対象を選ばなくても押せる。 */}
+          <div className="tool-group-label">追加</div>
+          <div className="layer-ops">
+            <LayerOpButton
+              icon="layerAdd"
+              label="レイヤー"
+              title="新しいレイヤーを最上位に追加して、それを選択・描き先にする"
+              onClick={addLayer}
+              disabled={previewing}
+            />
+            <LayerOpButton
+              icon="folderAdd"
+              label="フォルダ"
+              title="空のフォルダを最上位に追加（行を持ち上げて中央へ落とすと収納できる）"
+              onClick={addFolder}
+              disabled={previewing}
+            />
+            <LayerOpButton
+              icon="variantAdd"
+              label="差分追加"
+              title="選んでいる行の横に、空の差分を増やす（＝そのスロットに横軸を持たせる）。横に並ぶ差分は同時には存在せず、行を左右にスライドして切り替える"
+              onClick={() => addVariant(false)}
+              disabled={previewing || !opTarget()}
+            />
+            <LayerOpButton
+              icon="variantCopy"
+              label="差分複製"
+              title="選んでいる行の内容を複製して、その複製を新しい差分として横に増やす（案A を少し変えた案B を作る用）"
+              onClick={() => addVariant(true)}
+              disabled={previewing || !opTarget()}
+            />
+            <LayerOpButton
+              icon="slotEmpty"
+              label="空スロット"
+              title="選んでいる行に「何も無い」という差分を足す。これを選べばその行は絵に出ません（＝「非表示にして残す」の置き換え）。状態の所属先にもなるので、「ver1 ではここは無し」を関係として持てます"
+              onClick={addEmptySlot}
+              disabled={previewing || !opTarget()}
+            />
+          </div>
+          {/* 選んだ 1 行に効く操作。行の中にはボタンを置かず（行は掴む・眺める場所にしておきたい）、
+              「どの行に効くのか」は見出しに名前を出して示す。 */}
           {(() => {
-            const al = getActiveLayer();
+            const t = opTarget();
+            const node = t?.node;
+            const leaf = t?.leaf ?? null;
+            const stack = t?.stack ?? null;
+            // 表示/非表示は行（スロット）に効かせる。中身ごとの非表示は持たせない。
+            const visTarget = t ? visibilityTarget(t) : null;
+            // 空スロットは「何も無い」を表す中身なので、中身をいじる操作は効かない。
+            const isEmpty = !!node && isEmptySlot(node);
             // クリップは「解除」も含めてトグル。まだ付いていないのに下地が無い時だけ押せない。
-            const clipEnabled = !!al && (al.clipped || canClip(al));
+            const clipEnabled = !!leaf && (!!leaf.clipped || canClip(leaf));
+            const canDelete = !!node && leafCount() - collectLeafIds(node).length >= 1;
+            const isVariant = !!stack;
             return (
-              <div className="layer-ops">
-                <LayerOpButton
-                  icon="layerAdd"
-                  label="レイヤー"
-                  title="新しいレイヤーを最上位に追加して、それをアクティブにする"
-                  onClick={addLayer}
-                  disabled={previewing}
-                />
-                <LayerOpButton
-                  icon="folderAdd"
-                  label="フォルダ"
-                  title="空のフォルダを最上位に追加（行を持ち上げて中央へ落とすと収納できる）"
-                  onClick={addFolder}
-                  disabled={previewing}
-                />
-                <LayerOpButton
-                  icon="clip"
-                  label="クリップ"
-                  title={
-                    !al
-                      ? 'レイヤーを選んでください（フォルダにはクリップできません）'
-                      : al.clipped
-                        ? 'クリッピングを解除する'
-                        : clipEnabled
-                          ? '下のレイヤーにクリップ (clipping mask): 下地のある所にだけ描いた色が乗る'
-                          : '直下にレイヤーが無いためクリップできません'
-                  }
-                  onClick={() => al && toggleClip(al)}
-                  disabled={previewing || !clipEnabled}
-                  on={!!al?.clipped}
-                />
-                <LayerOpButton
-                  icon="mergeDown"
-                  label="下と結合"
-                  title={
-                    al && canMergeDown(al)
-                      ? '下のレイヤーと統合 (merge down): 2枚を1枚に焼き付ける'
-                      : '下に統合できるレイヤーがありません（フォルダ・差分の中は対象外）'
-                  }
-                  onClick={() => al && mergeDown(al)}
-                  disabled={previewing || !al || !canMergeDown(al)}
-                />
-                <LayerOpButton
-                  icon="variantAdd"
-                  label="差分追加"
-                  title="アクティブレイヤーの横に、空の差分レイヤーを増やす（＝そのスロットに横軸を持たせる）。横に並ぶ差分は同時には存在せず、行を左右にスライドして切り替える"
-                  onClick={() => addVariant(false)}
-                  disabled={previewing}
-                />
-                <LayerOpButton
-                  icon="variantCopy"
-                  label="差分複製"
-                  title="いまの内容を複製して、その複製を新しい差分として横に増やす（案A を少し変えた案B を作る用）"
-                  onClick={() => addVariant(true)}
-                  disabled={previewing}
-                />
-                <LayerOpButton
-                  icon="layerClear"
-                  label="全消去"
-                  title="アクティブレイヤーの中身を全部消す（レイヤー自体は残る。Undo で戻せます）"
-                  onClick={clearActiveLayer}
-                  disabled={previewing || !al}
-                />
-              </div>
+              <>
+                <div className="tool-group-label">
+                  選択中
+                  {node ? (
+                    <span className="layer-ops-target" title="上のボタンはこの行に効きます">
+                      {isGroup(node) ? '📁 ' : ''}
+                      {node.name}
+                      {isVariant ? '（差分）' : ''}
+                    </span>
+                  ) : (
+                    <span className="muted">なし</span>
+                  )}
+                </div>
+                {/* 選択（＝ボタンの効き先）と描き先が食い違うのは、フォルダやスロットを選んだ
+                    ときだけ。その間どこに筆が乗るのか分からなくならないよう、食い違うときだけ出す。 */}
+                {node && node.id !== activeLayerId && (
+                  <div className="layer-draw-target">
+                    描き先
+                    <span title="フォルダは描き先になれません。筆・消しゴム・塗りはこの行に効きます（行の「描」印と同じ）">
+                      {getNode(session.state, activeLayerId)?.name ?? '—'}
+                    </span>
+                  </div>
+                )}
+                <div className="layer-ops">
+                  <LayerOpButton
+                    icon={visTarget?.visible === false ? 'hidden' : 'visible'}
+                    label={visTarget?.visible === false ? '非表示' : '表示'}
+                    title={
+                      !visTarget
+                        ? '行を選んでください'
+                        : visTarget.visible
+                          ? `表示中（押すと${isVariant ? 'この行ごと' : ''}絵から外す）${
+                              isVariant
+                                ? '。これは一時的に行を消す操作で、全状態に効きます。「この状態では出さない」は空スロットに所属させて表します'
+                                : ''
+                            }`
+                          : '非表示（押すと絵に戻す）'
+                    }
+                    onClick={() => visTarget && toggleVisibility(visTarget)}
+                    disabled={previewing || !visTarget}
+                    on={visTarget?.visible === false}
+                    tone="off"
+                  />
+                  <LayerOpButton
+                    icon="blendMultiply"
+                    label="乗算"
+                    title={
+                      !node
+                        ? '行を選んでください'
+                        : isEmpty
+                          ? '空スロットには合成方法がありません（何も出ないので）'
+                          : node.blendMode === 'multiply'
+                            ? '乗算で合成中（押すと通常合成に戻す）'
+                            : `通常合成（押すと乗算に。下の色に掛かるので影や線画向き${
+                                isGroup(node) ? '。フォルダなら中身をまとめて掛ける' : ''
+                              }）`
+                    }
+                    onClick={() => node && toggleMultiply(node)}
+                    disabled={previewing || !node || isEmpty}
+                    on={node?.blendMode === 'multiply'}
+                    tone="mul"
+                  />
+                  <LayerOpButton
+                    icon="clip"
+                    label="クリップ"
+                    title={
+                      !leaf
+                        ? 'レイヤーを選んでください（フォルダはクリップできません）'
+                        : leaf.clipped
+                          ? 'クリッピングを解除する'
+                          : clipEnabled
+                            ? '下のレイヤーにクリップ (clipping mask): 下地のある所にだけ描いた色が乗る'
+                            : '直下にレイヤーが無いためクリップできません'
+                    }
+                    onClick={() => leaf && toggleClip(leaf)}
+                    disabled={previewing || !clipEnabled}
+                    on={!!leaf?.clipped}
+                    tone="clip"
+                  />
+                  <LayerOpButton
+                    icon="mergeDown"
+                    label="下と結合"
+                    title={
+                      node && canMergeDown(node)
+                        ? '下のレイヤーと統合 (merge down): 2枚を1枚に焼き付ける'
+                        : '下に統合できるレイヤーがありません（フォルダ・差分の中は対象外）'
+                    }
+                    onClick={() => node && mergeDown(node)}
+                    disabled={previewing || !node || !canMergeDown(node)}
+                  />
+                  <LayerOpButton
+                    icon="layerClear"
+                    label="全消去"
+                    title={
+                      leaf
+                        ? '中身を全部消す（レイヤー自体は残る。Undo で戻せます）'
+                        : 'レイヤーを選んでください（フォルダは中身ごとの消去に未対応）'
+                    }
+                    onClick={() => leaf && clearLayerContent(leaf)}
+                    disabled={previewing || !leaf}
+                  />
+                  <LayerOpButton
+                    icon="layerDelete"
+                    label="削除"
+                    title={
+                      !node
+                        ? '行を選んでください'
+                        : !canDelete
+                          ? 'これ以上消すとレイヤーが 0 枚になります'
+                          : isVariant
+                            ? 'この差分を削除（残り1つになったら横軸は解除）'
+                            : isGroup(node)
+                              ? 'このフォルダを中身ごと削除'
+                              : 'このレイヤーを削除'
+                    }
+                    onClick={() => {
+                      if (!node) return;
+                      if (stack) removeVariant(stack, node);
+                      else deleteLayer(node);
+                    }}
+                    disabled={previewing || !node || !canDelete}
+                  />
+                </div>
+              </>
             );
           })()}
           {/* 読み込み・書き出しはレイヤー構造をいじる操作ではない（PSD に至ってはドキュメントごと
@@ -3840,8 +5037,10 @@ export function CanvasEditor({
             }}
           />
           {(() => {
-            // アクティブレイヤー1つに対する不透明度スライダー（各行から集約）。
-            const al = getActiveLayer();
+            // 選んでいる行 1 つに対する不透明度スライダー（他の操作ボタンと効き先を揃える。
+            // フォルダを選べばフォルダ全体の不透明度になる）。空スロットは何も出ないので対象外。
+            const raw = opTarget()?.node;
+            const al = raw && !isEmptySlot(raw) ? raw : null;
             const v = al ? (opacityDraft?.id === al.id ? opacityDraft.v : al.opacity) : 1;
             return (
               <div className="layer-active-opacity">
@@ -3862,39 +5061,211 @@ export function CanvasEditor({
               </div>
             );
           })()}
-          <ul className="layer-list">
-            {session.state.layers
-              .slice()
-              .reverse()
-              .map((n) => renderNode(n, 0, session.state.layers))}
-          </ul>
-          <p className="hint">
-            <b>行の掴み方</b>: 移動（並べ替え・フォルダ出し入れ・差分化）と、差分の左右スライドは、
-            <b>向きではなく時間で分かれます</b>。<b>押してすぐ横へ動かす＝スライド</b>、
-            <b>押したまま少し待つ＝持ち上がって移動</b>。⠿ を掴めば待たずに持ち上がります。
-          </p>
-          <p className="hint">
-            <b>横軸（差分）を作る</b>: 行を持ち上げてから<b>横へずらして</b>別の行へ落とすと、
-            縦に積まずにその行の<b>隣に並ぶ差分</b>になります。緑の縦棒が出た側（左/右）に入り、
-            相手がまだ普通のレイヤーでも自動で横軸に化けます。持ち上げてまっすぐ縦なら並べ替えです。
-            上の<b>差分追加 / 差分複製</b>でも同じものが作れます（空 / 複製の差分を増やす）。
-          </p>
-          <p className="hint">
-            <b>横軸（差分）を切り替える</b>: ⇹ 行を<b>左右にドラッグ</b>すると並列の差分が出てきます。
-            行の下のサムネイルは<b>ホバーで確認・クリックで確定</b>（ホバー中は履歴に残りません）。
-            <b>, / .</b> キーでも往復できるので、A と B をパタパタ見比べられます。
-            横に並ぶ差分は互いに独立で、出ている 1 枚だけが絵に載ります。
-          </p>
-          <p className="hint">
-            <b>横軸をほどく</b>: ⇹ 行の ▸ を押すと中の差分が縦に並びます。そこから 1 枚
-            <b>持ち上げて外へ</b>出せば、スロットを出て普通のレイヤーに戻ります（＝分解）。
-            控えの行をクリックすればその差分に切り替わり、🗑 で 1 枚捨てられます。
-            差分が 1 枚だけになった時点で横軸は自動的に解けます。
-          </p>
-          <p className="hint">
-            持ち上げた行はフォルダの中央に落とすと収納、余白に落とすと最上位へ（ペン/タッチ可）。
-            ⤵ で下のレイヤーにクリップ。
-          </p>
+          {/* 状態（ver1 / ver2）。名札がレールの頭で、押すとその状態が出る。
+              名札の色と、リストの左を走る線の色が対応している（名前の幅はレール間隔に収まらないので、
+              位置ではなく色で対応させる）。 */}
+          <div className="tool-group-label">
+            状態
+            <span className="muted"> — 別の行にいる差分どうしの関係</span>
+          </div>
+          <div className="state-bar">
+            {stateList.map((st, si) => {
+              const live = liveAttachmentsOf(session.state, st.id);
+              const on = stateSatisfied(session.state, st.id);
+              return (
+                <span key={st.id} className={`state-chip${on ? ' on' : ''}`}>
+                  <span className="state-swatch" style={{ background: railColor(si) }} />
+                  {editingStateId === st.id ? (
+                    <input
+                      className="state-name-input"
+                      autoFocus
+                      value={editingStateName}
+                      onChange={(e) => setEditingStateName(e.target.value)}
+                      onBlur={() => commitStateRename(st)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitStateRename(st);
+                        else if (e.key === 'Escape') setEditingStateId(null);
+                      }}
+                    />
+                  ) : (
+                    <button
+                      className="state-apply"
+                      onClick={() => applyStateNow(st)}
+                      onDoubleClick={() => startStateRename(st)}
+                      disabled={previewing}
+                      title={
+                        live.length === 0
+                          ? `${st.name} にはまだ何も所属していません（行の左のレールを押してくっつけます）`
+                          : on
+                            ? `${st.name} がいまそのまま出ています（所属 ${live.length} 行）／ダブルクリックで名称変更`
+                            : `押すと ${st.name} を出す：所属している ${live.length} 行が一斉に切り替わります（スロットが 1 つの行は動きません）／ダブルクリックで名称変更`
+                      }
+                    >
+                      {st.name}
+                      <span className="state-count">{live.length}</span>
+                    </button>
+                  )}
+                  <button
+                    className="state-del"
+                    onClick={() => deleteState(st)}
+                    disabled={previewing}
+                    title="この状態を消す（付いていた所属が一斉に外れるだけで、スロットは 1 つも消えません）"
+                  >
+                    ✕
+                  </button>
+                </span>
+              );
+            })}
+            <button
+              className="state-add"
+              onClick={addState}
+              disabled={previewing}
+              title="状態を作る"
+            >
+              ＋ 状態
+            </button>
+          </div>
+          {stateList.length > 0 && !stateList.some((s) => stateSatisfied(session.state, s.id)) && (
+            // 「どの状態でもない」を言えるようにする。名前で手管理していると気づけない種類のズレで、
+            // 実データでも影の差分が両方とも非表示のまま保存されていた。
+            <p className="state-note">
+              いまの絵は<b>どの状態でもありません</b>
+              （どこかの行が、状態の指すスロットと違うものを出しています）。
+            </p>
+          )}
+          {/* ここから下だけがスクロールする。上の操作パネル（追加 / 選択中 / 不透明度）は
+              リストがどれだけ伸びても同じ位置に留まり、行を選んだまま押しに行ける。 */}
+          <div className="layer-scroll">
+            <div
+              className="layer-tree"
+              ref={layerTreeRef}
+              style={{ paddingLeft: railGutterW || undefined }}
+            >
+              {renderStateRails(stateList)}
+              <ul className="layer-list">
+                {session.state.layers
+                  .slice()
+                  .reverse()
+                  .map((n) => renderNode(n, 0, session.state.layers))}
+              </ul>
+            </div>
+            <p className="hint">
+              <b>操作はすべて上のボタン</b>: 行の中にはボタンを置いていません。行を
+              <b>クリックして選ぶ</b>と
+              「選択中」の見出しにその名前が出て、上のボタンがその行に効きます。
+              <b>青枠が付いた行が 選択中</b>
+              で、フォルダやスロットもレイヤーと同じように選べます。ただし
+              <b>描き先</b>
+              （筆が乗る先）はフォルダにはなれないので、フォルダを選んでいる間は
+              <b>描</b>{' '}
+              の印が付いたリーフに残ります（見出しの「描き先」にも名前が出ます）。行に残っている
+              <b>描 / 非 / 乗 / ⤵</b> は押せない目印で、その行がいまどうなっているかだけを示します。
+              <b>フォルダはサムネイルの形</b>（左上にタブの付いた形）で分かります。行でも
+              カルーセルのコマでも同じ形なので、<b>どのコマがフォルダか</b>が中身を読まずに分かります。
+            </p>
+            <p className="hint">
+              <b>行の掴み方</b>:
+              移動（並べ替え・フォルダ出し入れ・差分化）と、差分の左右スライドは、
+              <b>向きではなく時間で分かれます</b>。<b>押してすぐ横へ動かす＝スライド</b>、
+              <b>押したまま少し待つ＝持ち上がって移動</b>。⠿ を掴めば待たずに持ち上がります。
+            </p>
+            <p className="hint">
+              <b>横軸（差分）を作る</b>: 持ち上げて相手の行へ運ぶと
+              <b>カルーセルが行いっぱいに開く</b>ので、<b>隣に入れたいコマの左半分／右半分</b>
+              へ落とします（そのコマの入る側に緑の縁が出ます。差分が何枚あっても
+              <b>端のコマまで必ず見えます</b>）。
+              <b>まだ差分の無い行</b>でも<b>横へずらせば その行 1 枚だけの帯</b>
+              が開くので、初めての 1 枚も 2 枚目以降も同じ落とし方です（相手が普通のレイヤーでも
+              自動で横軸に化けます）。 上の
+              <b>差分追加 / 差分複製 / 空スロット</b>でも増やせます。
+            </p>
+            <p className="hint">
+              <b>横軸（差分）を見る・切り替える</b>: サムネイルは
+              <b>どの行も同じ位置（名前の右）</b>に立っていて、差分のある行では
+              <b>その左右に控えの差分が薄く覗きます</b>
+              （覗いている側に続きがある＝いま端にいるのか真ん中にいるのかも分かります）。
+              その<b>サムネイルにカーソルを乗せるとカルーセルが開き</b>
+              、覗いていたものが左右に広がって見えます（<b>⠿ / ▾ / 名前</b>
+              の上では開きません。差分にしたフォルダはそのまま ▾ で開けます）。
+              <b>窓を広げるほど帯も長くなる</b>ので、差分が多い行はパネルを広げると端まで見えます。
+              <b>コマをクリックで切り替え</b>。<b>帯のコマ以外のところ</b>
+              （両端の余白・コマとコマの隙間・コマの上下）<b>を掴んで左右に引く</b>
+              と帯そのものが流れます（コマの上は「そのコマを掴む」＝並べ替え・取り出しなので、
+              引っ張る手は地の側が受けます。カーソルの形が ⇔ と ✋ で分かれます）。
+              行を左右にドラッグしても同じです。
+              どちらも<b>指を動かしている間だけ</b>絵が追従し、離した時点で確定＝1 回の Undo
+              で戻せます。 <b>乗せただけでは絵は変わりません</b>。見比べは <b>, / .</b>{' '}
+              キーで往復するのが速いです。
+              横に並ぶ差分は互いに独立で、出ている 1 枚だけが絵に載ります。
+            </p>
+            <p className="hint">
+              <b>「無い」は差分の 1 枚として置く</b>: 横に並ぶ差分は互いに排他なので、
+              <b>差分ごとの表示/非表示は持たせていません</b>
+              （出ていない差分の非表示フラグは誰にも効かず、
+              スライドして出した瞬間に「出したのに何も無い」になるため）。代わりに上の
+              <b>空スロット</b>
+              で「何も無い」を横に足します。これを選べばその行は絵に出ず、
+              <b>状態の所属先にもなる</b>ので 「ver1
+              ではここは無し」を関係として持てます（レールでは<b>横棒</b>
+              で出ます）。 非表示レイヤーをスロットに入れると、その非表示は
+              <b>スロットの選択に引き継がれて外れます</b>。
+            </p>
+            <p className="hint">
+              <b>表示ボタンは行に効きます</b>: スロット行を選んで<b>表示</b>
+              を押すと、 中の差分ではなく<b>行ごと</b>
+              絵から外れます（全状態に効く一時的な操作）。
+              「この状態では出さない」は空スロットの方で表します。2 つの意味を分けているので、
+              取り違えて片方が消えたままになることがありません。
+            </p>
+            <p className="hint">
+              <b>コマを掴む / 行を掴む</b>: カルーセルの
+              <b>コマを掴んで動かす</b>と、同じ帯の中では
+              <b>並べ替え</b>、<b>外の行へ出せば取り出し</b>
+              （スロットを出て普通のレイヤーに戻る＝分解）。 差分ぜんぶをまとめて動かしたいときは{' '}
+              <b>⠿ を掴みます</b>
+              （カルーセルは行の中央に開くので ⠿ / ▾ は覆いません）。
+              いま出ている差分を捨てるなら、その差分を出してから上の<b>削除</b>。 差分が 1
+              枚だけになった時点で横軸は自動的に解けます。
+            </p>
+            <p className="hint">
+              持ち上げた行はフォルダの中央に落とすと収納、余白に落とすと最上位へ（ペン/タッチ可）。
+            </p>
+            <p className="hint">
+              <b>状態（ver1 / ver2）</b>: 上の<b>＋ 状態</b>
+              で作ると、リストの左に<b>その色の縦線（レール）</b>が 1 本立ちます。
+              <b>行の左のレールを押す</b>と、その行の
+              <b>いま出ているスロット</b>がその状態に くっつきます（
+              <b>1 クリック</b>。もう一度押すと外れます）。<b>塗った丸</b>
+              ＝所属していて今そのまま、
+              <b>白抜きの丸</b>＝所属しているが
+              <b>別のスロットが出ている（ズレ）</b>、<b>細い輪</b>
+              ＝まだ何も付いていない。
+            </p>
+            <p className="hint">
+              <b>線の読み方</b>: 線が<b>素通り</b>している行は、スロットが 1 つしかないので
+              <b>全状態で自動的に共有</b>
+              されています（宣言も操作も要りません＝だから何も置いていない）。 線が
+              <b>途切れている</b>行は、その状態が<b>そこを通っていない</b>
+              ——所属していないか、
+              その状態が選ばないスロットの中身です。「線が無い」と「共有されている」を見分けられるように、
+              共有は線・不参加は途切れ、と対比させています。
+            </p>
+            <p className="hint">
+              <b>状態を出す</b>: 上の名札を押すと、<b>所属している行が一斉に</b>
+              そのスロットへ切り替わります （1 op ＝ Undo 1 回）。スロットが 1
+              つの行と、どのスロットも選んでいない行は動きません。 名札のダブルクリックで名称変更、✕
+              で削除（
+              <b>スロットは 1 つも消えず</b>、所属だけが一斉に外れます）。
+            </p>
+            <p className="hint">
+              <b>乗算</b>: 上の<b>乗算</b>ボタンで、選んだ行を下の色に
+              <b>掛ける</b>合成に切り替えます（白は透け、
+              濃い色ほど残る＝影・線画の乗算）。フォルダに掛けると
+              <b>中身をまとめて</b>下地に掛かります。 PSD
+              の乗算レイヤーはこの合成方法として読み込まれます（乗算以外のブレンドモードは未対応で、
+              通常合成に倒したうえで枚数をコンソールに出します）。
+            </p>
+          </div>
         </Section>
       </FloatWindow>
     </div>

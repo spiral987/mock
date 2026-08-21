@@ -1,4 +1,4 @@
-import type { BBox, EditorState, Layer, LayerNode, Operation } from '../../types';
+import type { BBox, BlendMode, EditorState, Layer, LayerNode, Operation } from '../../types';
 import type { OpHandler } from '../operation';
 import {
   getLayer,
@@ -127,6 +127,42 @@ export function createSetLayerOpacityOp(layerId: string, opacity: number, region
     type: 'setLayerOpacity',
     klass: 'edit',
     params: { layerId, opacity: Math.max(0, Math.min(1, opacity)) },
+    region: region ?? EMPTY,
+    layerId,
+    timestamp: Date.now(),
+  };
+}
+
+// ---- 合成方法（ブレンドモード。リーフ・グループ共通） ----------------------
+export interface SetLayerBlendModeParams {
+  layerId: string;
+  blendMode: BlendMode;
+}
+
+export const setLayerBlendModeHandler: OpHandler = {
+  type: 'setLayerBlendMode',
+  klass: 'edit',
+  apply(state, op) {
+    if (!getNode(state, op.layerId)) return state;
+    const { blendMode } = op.params as unknown as SetLayerBlendModeParams;
+    // 未知の値（将来のモードを含む古い/新しいログ）は normal に倒す。合成規則なので、
+    // 落ちても絵が壊れるだけで replay の決定性は保たれる。
+    const mode: BlendMode = blendMode === 'multiply' ? 'multiply' : 'normal';
+    return updateNode(state, op.layerId, (n) => ({ ...n, blendMode: mode }));
+  },
+  consolidate: sameTarget,
+};
+
+export function createSetLayerBlendModeOp(
+  layerId: string,
+  blendMode: BlendMode,
+  region?: BBox,
+): Operation {
+  return {
+    id: genId('setLayerBlendMode'),
+    type: 'setLayerBlendMode',
+    klass: 'edit',
+    params: { layerId, blendMode },
     region: region ?? EMPTY,
     layerId,
     timestamp: Date.now(),
@@ -388,34 +424,9 @@ export function createAddGroupOp(groupId: string, name: string, wrapLayerId?: st
 }
 
 // ---- フォルダの折りたたみ（UI 状態だが replay 整合のため操作化） ------------
-export interface SetGroupCollapsedParams {
-  groupId: string;
-  collapsed: boolean;
-}
-
-export const setGroupCollapsedHandler: OpHandler = {
-  type: 'setGroupCollapsed',
-  klass: 'edit',
-  apply(state, op) {
-    const { groupId, collapsed } = op.params as unknown as SetGroupCollapsedParams;
-    const node = getNode(state, groupId);
-    if (!node || !isGroup(node)) return state;
-    return updateNode(state, groupId, (n) => ({ ...n, collapsed }));
-  },
-  consolidate: sameTarget,
-};
-
-export function createSetGroupCollapsedOp(groupId: string, collapsed: boolean): Operation {
-  return {
-    id: genId('setGroupCollapsed'),
-    type: 'setGroupCollapsed',
-    klass: 'edit',
-    params: { groupId, collapsed },
-    region: EMPTY,
-    layerId: groupId,
-    timestamp: Date.now(),
-  };
-}
+// フォルダの開閉に op は無い。見た目しか変わらないものを log に積むと、開閉のたびに
+// undo が 1 回ぶん食われる（絵は何も変わっていないのに Undo が効かなくなったように見える）。
+// 開閉は CanvasEditor がローカルに覚える。
 
 // ---- 全消去（リーフ内容を透明に） -----------------------------------------
 export interface ClearLayerParams {

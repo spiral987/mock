@@ -6,8 +6,10 @@
 // サイズでセッションを作り直し、session.applyBatch(ops) で 1回の Undo 単位として取り込む。
 //
 // 対応: レイヤー名 / 位置(offset) / 不透明度 / 表示・非表示 / フォルダ階層 / 折りたたみ状態 /
-//   クリッピング（エンジンのライブなクリッピングとして復元。ピクセルは焼き込まない）。
-// 非対応(MVP): ブレンドモード（すべて normal 合成）/ レイヤーマスク / グループのクリッピング /
+//   クリッピング（エンジンのライブなクリッピングとして復元。ピクセルは焼き込まない）/
+//   乗算（multiply。ブレンドモードのうち乗算だけエンジンが持つ合成方法として復元）。
+// 非対応(MVP): 乗算以外のブレンドモード（normal に倒す。落とした枚数は結果に含めて報告する）/
+//   レイヤーマスク / グループのクリッピング /
 //   調整レイヤー・テキストのベクター情報（ラスタライズ済み画素のみ取り込む）。
 //
 // レイヤー順序について:
@@ -15,7 +17,7 @@
 //   当エンジンも layers[0] が最背面で、末尾に追加＝最前面。したがって children を
 //   前方（0→末尾＝下→上）に処理し、各ノードをフォルダ末尾へ足せば重なり順が一致する。
 import { readPsd, type Layer as PsdLayer } from 'ag-psd';
-import type { ImageBuffer, Operation } from '../types';
+import type { BlendMode, ImageBuffer, Operation } from '../types';
 import { genId } from '../util/id';
 import { BASE_LAYER_ID } from '../engine/editorState';
 import {
@@ -26,7 +28,7 @@ import {
   createSetLayerOpacityOp,
   createSetLayerVisibilityOp,
   createSetLayerClippingOp,
-  createSetGroupCollapsedOp,
+  createSetLayerBlendModeOp,
 } from '../engine/operations';
 
 export interface PsdImportResult {
@@ -41,6 +43,15 @@ export interface PsdImportResult {
   groupCount: number;
   /** クリッピング指定で取り込んだレイヤー数。 */
   clipCount: number;
+  /** 乗算として取り込んだノード数（レイヤー・フォルダ合算）。 */
+  multiplyCount: number;
+  /** 乗算以外のブレンドモードだったため normal に倒したノード数（＝見た目が PSD と違う箇所）。 */
+  droppedBlendCount: number;
+  /**
+   * PSD 上で畳まれていたフォルダの id。開閉は log に載せない（見た目しか変わらないものを
+   * op にすると undo を 1 回ぶん食う）ので、op ではなく値として返して UI 側に覚えてもらう。
+   */
+  collapsedGroupIds: string[];
   /** 上限超過で縮小したか（PSD が maxDim より大きいとき true）。 */
   scaled: boolean;
   /** PSD 本来のサイズ。 */
@@ -52,6 +63,20 @@ export interface PsdImportResult {
 function normOpacity(o: number | undefined): number {
   if (o === undefined) return 1;
   return o > 1 ? o / 255 : o;
+}
+
+/**
+ * PSD のブレンドモード → エンジンの合成方法。いま持っているのは乗算だけ。
+ *   'multiply'                  → 乗算として復元する
+ *   'normal' / 'pass through'   → 通常合成（落としていない。'pass through' はグループの既定値で、
+ *                                 当エンジンのフォルダは常に isolation なので通常合成に相当する）
+ *   それ以外                     → 通常合成に倒す（＝PSD と見た目が変わる。枚数を数えて報告する）
+ * 返り値: 設定すべき合成方法（null = 何も設定しない）と、倒したかどうか。
+ */
+function mapBlendMode(m: PsdLayer['blendMode']): { mode: BlendMode | null; dropped: boolean } {
+  if (m === 'multiply') return { mode: 'multiply', dropped: false };
+  if (m === undefined || m === 'normal' || m === 'pass through') return { mode: null, dropped: false };
+  return { mode: null, dropped: true };
 }
 
 /**
@@ -95,6 +120,19 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
   let leafCount = 0;
   let groupCount = 0;
   let clipCount = 0;
+  let multiplyCount = 0;
+  let droppedBlendCount = 0;
+  const collapsedGroupIds: string[] = [];
+
+  /** 合成方法を復元する op を（乗算のときだけ）積む。倒した分は数える。 */
+  const pushBlendMode = (nodeId: string, node: PsdLayer): void => {
+    const { mode, dropped } = mapBlendMode(node.blendMode);
+    if (mode) {
+      ops.push(createSetLayerBlendModeOp(nodeId, mode));
+      multiplyCount++;
+    }
+    if (dropped) droppedBlendCount++;
+  };
 
   // 兄弟配列を下→上（前方）に処理する。addImageLayer / addGroup は最上位末尾（＝最前面）に
   // 追加されるので、parentId があるときだけ moveNode でそのフォルダの末尾へ入れ直す。
@@ -110,7 +148,8 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
         const op = normOpacity(node.opacity);
         if (op < 1) ops.push(createSetLayerOpacityOp(groupId, op));
         if (node.hidden) ops.push(createSetLayerVisibilityOp(groupId, false));
-        if (node.opened === false) ops.push(createSetGroupCollapsedOp(groupId, true));
+        if (node.opened === false) collapsedGroupIds.push(groupId);
+        pushBlendMode(groupId, node);
         groupCount++;
         addSiblings(node.children, groupId);
         continue;
@@ -128,6 +167,7 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
       const op = normOpacity(node.opacity);
       if (op < 1) ops.push(createSetLayerOpacityOp(layerId, op));
       if (node.hidden) ops.push(createSetLayerVisibilityOp(layerId, false));
+      pushBlendMode(layerId, node);
       // クリッピング: エンジンのライブなクリッピングとして復元（直下の非クリップ下地にクリップ）。
       if (node.clipping) {
         ops.push(createSetLayerClippingOp(layerId, true));
@@ -149,7 +189,10 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
     ops,
     leafCount,
     groupCount,
+    collapsedGroupIds,
     clipCount,
+    multiplyCount,
+    droppedBlendCount,
     scaled: scale < 1,
     psdWidth,
     psdHeight,

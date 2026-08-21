@@ -31,7 +31,12 @@ export type ToolIconName =
   | 'mergeDown'
   | 'variantAdd'
   | 'variantCopy'
-  | 'layerClear';
+  | 'slotEmpty'
+  | 'layerClear'
+  | 'layerDelete'
+  | 'blendMultiply'
+  | 'visible'
+  | 'hidden';
 
 interface Props {
   name: ToolIconName;
@@ -221,6 +226,49 @@ const PATHS: Record<ToolIconName, ReactNode> = {
       <path d="M4.6 14.4c.9-2.6 2-3.9 3.4-3.9" />
       <rect x="13" y="6.5" width="8.5" height="11" rx="1.3" />
       <path d="M15.1 14.4c.9-2.6 2-3.9 3.4-3.9" />
+    </>
+  ),
+  // 空スロット: 中身のある板の横に、何も入らない板（破線＋斜線）が並ぶ。
+  // 「差分追加」の破線板に斜線を足したもの＝「増えるのは中身ではなく“無い”という選択肢」。
+  slotEmpty: (
+    <>
+      <rect x="2.5" y="6.5" width="8.5" height="11" rx="1.3" />
+      <path d="M4.6 14.4c.9-2.6 2-3.9 3.4-3.9" />
+      <rect x="13" y="6.5" width="8.5" height="11" rx="1.3" strokeDasharray="2.6 2.2" />
+      <path d="m14.6 16 6.3-8" />
+    </>
+  ),
+  // 表示中: 目
+  visible: (
+    <>
+      <path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6z" />
+      <circle cx="12" cy="12" r="2.6" />
+    </>
+  ),
+  // 非表示: 目に斜線
+  hidden: (
+    <>
+      <path d="M4 8.2C2.9 9.4 2.5 12 2.5 12s3.6 6 9.5 6c1.6 0 3-.3 4.3-.9" />
+      <path d="M19.4 15.6c1.4-1.3 2.1-3.6 2.1-3.6S17.9 6 12 6c-.7 0-1.4.1-2 .2" />
+      <path d="m4 20 16-16" />
+    </>
+  ),
+  // 削除: ごみ箱
+  layerDelete: (
+    <>
+      <path d="M4.5 6.5h15" />
+      <path d="M9.5 6.5V4.8a1.3 1.3 0 0 1 1.3-1.3h2.4a1.3 1.3 0 0 1 1.3 1.3v1.7" />
+      <path d="M6.5 6.5l.9 12.3a1.7 1.7 0 0 0 1.7 1.7h5.8a1.7 1.7 0 0 0 1.7-1.7l.9-12.3" />
+      <path d="M10.4 10v7M13.6 10v7" />
+    </>
+  ),
+  // 乗算: 薄いインクを2枚重ねると、重なった所だけ濃くなる（＝掛け算）
+  blendMultiply: (
+    <>
+      <circle cx="9.4" cy="12" r="5.6" fill="currentColor" opacity=".3" stroke="none" />
+      <circle cx="14.6" cy="12" r="5.6" fill="currentColor" opacity=".3" stroke="none" />
+      <circle cx="9.4" cy="12" r="5.6" />
+      <circle cx="14.6" cy="12" r="5.6" />
     </>
   ),
   // 全消去: 板は残して中身だけ空にする
