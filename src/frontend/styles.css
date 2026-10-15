@@ -3106,3 +3106,64 @@ button.active {
   text-align: center;
   margin-top: 3px;
 }
+/* ---- 場のゆがみキャリブレーション（WarpCalibration） ---- */
+.warp-calib {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(20, 21, 26, 0.7);
+}
+.warp-calib-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.warp-calib-msg {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.warp-calib-summary {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px 22px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.warp-calib-summary {
+  max-width: min(720px, 92vw);
+  line-height: 1.6;
+}
+.warp-calib-h {
+  margin-top: 6px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.warp-calib-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.warp-calib-actions .primary {
+  background: var(--accent);
+  color: #fff;
+}

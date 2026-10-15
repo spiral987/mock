@@ -111,6 +111,8 @@ import { bufferToDataURL } from './thumbnail';
 import { reorderIndex } from './layerDnd';
 import { ColorPicker } from './ColorPicker';
 import { FloatWindow, Section } from './Float';
+import { WarpField } from './warpField';
+import { WarpCalibration, type CalibArea } from './WarpCalibration';
 import { ToolIcon, type ToolIconName } from './ToolIcon';
 import { drawMarchingAnts, antsDash, ANTS_STEPS } from './marchingAnts';
 
@@ -565,6 +567,27 @@ export function CanvasEditor({
   // カルーセルの帯。指の動きに毎フレーム追従させるので、再レンダーを挟まず transform を直接書く。
   const carouselTrackRef = useRef<HTMLDivElement>(null);
   const [hovering, setHovering] = useState(false);
+  // 場のゆがみ補正: 「描きたい線」と「実際に引ける線」のズレを学習し、ブラシ入力をゆがめて補正する。
+  // 学習はキャリブレーション（ガイドをなぞるタスク）で行い、キャンバスへの描画では学習しない。
+  const [warp] = useState(() => new WarpField());
+  const [warpOn, setWarpOn] = useState(warp.enabled);
+  const [warpStrength, setWarpStrength] = useState(warp.strength);
+  const [warpCount, setWarpCount] = useState(warp.count);
+  const [warpMsg, setWarpMsg] = useState('');
+  const [calibArea, setCalibArea] = useState<CalibArea | null>(null);
+  /** キャリブレーション開始。ガイドはキャンバスが画面に見えている範囲に出す。 */
+  const startCalibration = () => {
+    const c = canvasRef.current;
+    const vp = viewportRef.current;
+    if (!c) return;
+    const r = c.getBoundingClientRect();
+    const v = vp ? vp.getBoundingClientRect() : r;
+    const left = Math.max(r.left, v.left);
+    const top = Math.max(r.top, v.top);
+    const right = Math.min(r.right, v.right);
+    const bottom = Math.min(r.bottom, v.bottom);
+    setCalibArea({ left, top, width: Math.max(right - left, 100), height: Math.max(bottom - top, 100) });
+  };
   const [zoom, setZoom] = useState(1);
   // パン(視点移動)は scroll ではなく transform で行う（キャンバスが画面に収まっていても動かせる）。
   // pan = キャンバス左上のビューポート左上からのオフセット(px)。
@@ -1124,6 +1147,21 @@ export function CanvasEditor({
       y: (ev.clientY - rect.top) * sy,
       pressure: ev.pointerType === 'mouse' ? 1 : ev.pressure > 0 ? ev.pressure : 0.5,
     }));
+  };
+
+  /**
+   * ブラシ入力点を場のゆがみで補正する。場は画面（client px）基準で持つので、
+   * キャンバス座標 → client 座標に戻して変位を求め、変位をキャンバス座標の倍率に直して足す。
+   */
+  const warpPoints = (pts: StrokePoint[]): StrokePoint[] => {
+    const c = canvasRef.current!;
+    const rect = c.getBoundingClientRect();
+    const sx = c.width / rect.width;
+    const sy = c.height / rect.height;
+    return pts.map((p) => {
+      const [dx, dy] = warp.feed(rect.left + p.x / sx, rect.top + p.y / sy);
+      return dx === 0 && dy === 0 ? p : { ...p, x: p.x + dx * sx, y: p.y + dy * sy };
+    });
   };
 
   const sizeCanvas = (ref: MutableRefObject<HTMLCanvasElement | null>): HTMLCanvasElement => {
@@ -1874,10 +1912,12 @@ export function CanvasEditor({
       sctx.clearRect(0, 0, width, height);
       sctx.drawImage(c, 0, 0);
     } else {
-      // brush / eraser
-      drawingRef.current = { strokes: [pt] };
+      // brush / eraser（入力は場のゆがみで補正してから記録する）
+      warp.begin();
+      const wpt = warpPoints([pt])[0];
+      drawingRef.current = { strokes: [wpt] };
       // 増分プレビューを構築（ルート直下の可視リーフのみ）。不可なら従来の決定的プレビュー。
-      if (buildBrushPreview(pt)) renderBrushPreview();
+      if (buildBrushPreview(wpt)) renderBrushPreview();
       else renderStrokePreview(drawingRef.current.strokes);
     }
   };
@@ -1928,7 +1968,7 @@ export function CanvasEditor({
     }
     if (drawingRef.current) {
       // 1イベントにまとまった中間サンプルを全て順序通り記録（速い線のファセット解消）。
-      const pts = getCoalescedPoints(e);
+      const pts = warpPoints(getCoalescedPoints(e));
       for (const pt of pts) {
         drawingRef.current.strokes.push(pt);
         if (brushPreviewRef.current) advanceBrush(pt); // 新区間だけ増分スタンプ（軽い）
@@ -1998,6 +2038,7 @@ export function CanvasEditor({
     if (drawingRef.current) {
       const strokes = drawingRef.current.strokes;
       drawingRef.current = null;
+      warp.end(); // 描画では学習しない（学習はキャリブレーションで行う）
       teardownBrushPreview(); // 増分プレビューのキャッシュ/保留rAFを破棄（以降は決定的 repaint）
       if (strokes.length > 0) {
         const op = strokeOp(strokes);
@@ -3435,6 +3476,18 @@ export function CanvasEditor({
 
   return (
     <div className="editor" ref={paneRef}>
+      {calibArea && (
+        <WarpCalibration
+          warp={warp}
+          area={calibArea}
+          onClose={(n) => {
+            setCalibArea(null);
+            setWarpCount(warp.count);
+            setWarpStrength(warp.strength); // 最適化で強さが変わる
+            setWarpMsg(n > 0 ? `キャリブレーション ${n} 本を学習しました` : '');
+          }}
+        />
+      )}
       <div
         className={`canvas-viewport ${zoomKey ? 'zoom-mode' : ''} ${spaceHeld ? 'pan-mode' : ''}`}
         ref={viewportRef}
@@ -3723,6 +3776,62 @@ export function CanvasEditor({
               </p>
             )}
           </div>
+        </Section>
+
+        <Section title="WARP（場のゆがみ補正）" defaultOpen>
+          <label className="field" title="ブラシ入力を学習した場でゆがめて、描きたい線に近づける">
+            <span>
+              <input
+                type="checkbox"
+                checked={warpOn}
+                onChange={(e) => {
+                  warp.enabled = e.target.checked;
+                  warp.save();
+                  setWarpOn(e.target.checked);
+                }}
+              />{' '}
+              補正 {warpOn ? 'ON' : 'OFF'}
+            </span>
+          </label>
+          <label className="field">
+            <span>強さ {warpStrength.toFixed(2)}</span>
+            <input
+              type="range"
+              min={0}
+              max={1.5}
+              step={0.05}
+              value={warpStrength}
+              onChange={(e) => {
+                warp.strength = Number(e.target.value);
+                warp.save();
+                setWarpStrength(warp.strength);
+              }}
+            />
+          </label>
+          <div className="tool-row">
+            <button className="primary" onClick={startCalibration} title="ガイド線をなぞって手のズレを学習する">
+              キャリブレーション
+            </button>
+          </div>
+          <div className="tool-row">
+            <span className="muted">学習サンプル {warpCount}</span>
+            <button
+              onClick={() => {
+                if (!window.confirm('学習した場のゆがみを消去しますか？')) return;
+                warp.reset();
+                setWarpCount(0);
+                setWarpMsg('学習をリセットしました');
+              }}
+            >
+              学習リセット
+            </button>
+          </div>
+          {warpMsg && <p className="hint">{warpMsg}</p>}
+          <p className="hint">
+            キャリブレーションで始点・終点・経路を指定したガイド（直線 / 円弧 / S字）をなぞると、手のズレを
+            場のゆがみとして学習し、ズレ方の傾向に合わせて補正のかけ方を最適化します。描画中は学習せず、
+            学習済みの場で入力を補正するだけです（ブラシ / 消しゴムのみ）。
+          </p>
         </Section>
 
         <Section title="CANVAS" defaultOpen={false}>
