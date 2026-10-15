@@ -8,8 +8,7 @@ import { genId } from '../../util/id';
  * レイヤーの buffer/offset は一切触らず、アートボード矩形 [0,0,w,h] の大きさ（＝flatten のクリップ範囲）
  * だけを変える非破壊リサイズ。縮小すると枠外に隠れ、拡大すると再び現れる（内容は消えない）。
  *
- * これをログに積むことで不変条件 state === replay(log) が保たれる（Replayer は元サイズの初期状態から
- * replay し、この op で現在サイズへ到達する）。Undo/Verify もそのまま成立する。
+ * サイズ変更も操作として記録し、Undo/Redo でキャンバスの大きさを復元できるようにする。
  */
 export interface CanvasSizeParams {
   width: number;

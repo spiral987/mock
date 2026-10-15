@@ -285,7 +285,7 @@ body {
   font-size: 12px;
 }
 
-/* キャンバス下部のフロートバー（ズーム + 履歴） */
+/* キャンバス下部のフロートバー（ズーム・視点移動） */
 .float-canvasbar {
   position: fixed;
   bottom: 12px;
@@ -304,16 +304,6 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
-}
-
-.float-canvasbar input[type='range'] {
-  width: 180px;
-}
-
-.cb-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--border);
 }
 
 /* ---- 折りたたみカテゴリ（+/−） ---- */
@@ -625,66 +615,6 @@ body {
   opacity: 0.7;
 }
 
-.preview-banner {
-  position: fixed;
-  top: 56px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 26;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
-  border-radius: 8px;
-  background: rgba(74, 59, 18, 0.9);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid #f2c94c;
-  color: #f7e6b0;
-  font-size: 12px;
-}
-
-.history {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.history input[type='range'] {
-  flex: 1;
-}
-
-.history-step {
-  min-width: 64px;
-  text-align: right;
-}
-
-.verify {
-  font-size: 12px;
-  margin: 8px 0 0;
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-
-.verify.ok {
-  background: #173a26;
-  color: #6fcf97;
-  border: 1px solid #2f6f4a;
-}
-
-.verify.ng {
-  background: #3a1717;
-  color: #eb5757;
-  border: 1px solid #6f2f2f;
-}
-
-.op-future {
-  opacity: 0.35;
-}
-
 .panels {
   display: flex;
   flex-direction: column;
@@ -891,24 +821,6 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-}
-
-/* 数回クリックで確定する破壊的ボタン（ConfirmButton）の armed 表示。 */
-.confirm-arming {
-  background: #3a1717 !important;
-  color: #eb5757 !important;
-  border-color: #6f2f2f !important;
-  animation: confirm-pulse 0.9s ease-in-out infinite;
-}
-
-@keyframes confirm-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.65;
-  }
 }
 
 button {
@@ -2048,60 +1960,6 @@ button.active {
 .muted {
   color: var(--muted);
   font-size: 11px;
-}
-
-.log-panel {
-  flex: 1;
-}
-
-.op-log {
-  list-style: none;
-  margin: 10px 0 0;
-  padding: 0;
-  max-height: 320px;
-  overflow-y: auto;
-  font-size: 12px;
-}
-
-.op {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 6px;
-  border-left: 3px solid var(--border);
-  margin-bottom: 2px;
-  background: var(--panel-2);
-  border-radius: 0 4px 4px 0;
-}
-
-/* klass ごとの色（原論文 Table 1 に対応、Phase 4 で RevG にも使用） */
-.op-rigid { border-left-color: #6fcf97; }
-.op-deform { border-left-color: #f2c94c; }
-.op-color { border-left-color: #56ccf2; }
-.op-edit { border-left-color: #bb6bd9; }
-.op-brush { border-left-color: #eb5757; }
-
-.op {
-  flex-wrap: wrap;
-}
-
-.op-index {
-  color: var(--muted);
-  min-width: 18px;
-}
-
-.op-type {
-  font-weight: 600;
-}
-
-.op-desc {
-  color: var(--muted);
-}
-
-.op-parents {
-  color: #7f8694;
-  margin-left: auto;
-  font-variant-numeric: tabular-nums;
 }
 
 /* ---- RevG ---- */

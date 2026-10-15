@@ -6,7 +6,7 @@ export const BASE_LAYER_ID = 'layer-base';
 
 /**
  * ルート（初期化）状態を決定的に生成する。
- * Replayer はこの状態から log を順に applyOperation して状態を再構築する（SPEC §6）。
+ * Undo/Redo で古い履歴を復元するときも、この状態から操作を適用する。
  */
 export function createInitialState(width: number, height: number): EditorState {
   const base = createLayer(BASE_LAYER_ID, 'Background', width, height);

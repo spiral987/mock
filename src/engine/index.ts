@@ -7,5 +7,4 @@ export * from './layer';
 export * from './imageBuffer';
 export * from './geom';
 export * from './composite';
-export * from './compare';
 export * from './operations';

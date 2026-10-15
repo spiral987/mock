@@ -21,7 +21,6 @@ export type ToolIconName =
   | 'rect'
   | 'lassoSelect'
   | 'transform'
-  | 'inspect'
   | 'undo'
   | 'redo'
   | 'deselect'
@@ -146,13 +145,6 @@ const PATHS: Record<ToolIconName, ReactNode> = {
       <rect x="17.5" y="3.5" width="3" height="3" fill="currentColor" />
       <rect x="3.5" y="17.5" width="3" height="3" fill="currentColor" />
       <rect x="17.5" y="17.5" width="3" height="3" fill="currentColor" />
-    </>
-  ),
-  // 履歴しらべ（旧 Select）: 虫めがね
-  inspect: (
-    <>
-      <circle cx="10.5" cy="10.5" r="6" />
-      <path d="m15 15 5 5" />
     </>
   ),
   undo: (

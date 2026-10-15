@@ -2,7 +2,6 @@ import type { BBox, EditorState, Operation } from './types';
 import { applyOperation } from './engine/operation';
 import { createInitialState } from './engine/editorState';
 import './engine/operations'; // 操作ハンドラを登録
-import { createBaselineOp } from './engine/operations';
 import { unionBBox } from './engine/geom';
 
 /**
@@ -34,16 +33,7 @@ interface HistoryEntry {
   state: EditorState | null;
 }
 
-/**
- * 編集セッション（痩せ型）。
- * 「画像の Git」部分（Logger の consolidate / DAG /
- * revision / board）を取り除き、UI が触る最小 API だけを残したもの。
- *
- * 不変条件: this.state === replay(this.log)。
- *   apply は op をそのまま逐次適用し、log にもそのまま積むだけなので常に成立する
- *   （consolidate を持たないぶん RevisionImage より単純に不変条件が保たれる）。
- *   これにより Replayer による履歴スクラブ / Verify が現状態とビット一致する。
- */
+/** 編集状態と Undo/Redo を管理する。古い履歴は内部の操作記録から復元する。 */
 export class EditorSession {
   state: EditorState;
   private log: Operation[] = [];
@@ -94,7 +84,7 @@ export class EditorSession {
   /**
    * 直前に apply した操作を newOp で置き換え、状態を newState へ直接差し替える。
    * 変形ツールが連続ジェスチャを1操作へ統合する際、全ログ replay を避けるための軽量経路。
-   * 呼び出し側は newState === replay(置換後ログ) を保証すること。undoStack は据え置き。
+   * 呼び出し側は newState が置換後の操作に対応することを保証する。undoStack は据え置き。
    */
   amendLast(newOp: Operation, newState: EditorState): void {
     if (this.log.length === 0) return;
@@ -151,17 +141,6 @@ export class EditorSession {
 
   getLog(): readonly Operation[] {
     return this.log;
-  }
-
-  /** 現在の絵（レイヤー構造）を1枚のベースラインに畳み、log・undo を捨てる。 */
-  flattenToBaseline(): void {
-    const op = createBaselineOp(this.state, this.width, this.height);
-    let s = createInitialState(this.width, this.height);
-    s = applyOperation(s, op);
-    this.state = s;
-    this.log = [op];
-    this.undoStack = [];
-    this.redoStack = [];
   }
 
   /** 完全初期化（白紙）。 */

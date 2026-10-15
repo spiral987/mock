@@ -17,9 +17,7 @@ import type {
   VariantState,
 } from '../types';
 import type { EditorSession } from '../session';
-import { statesEqual } from '../engine/compare';
 import { applyOperation } from '../engine/operation';
-import { Replayer } from '../backend/replayer';
 import {
   createAddImageLayerOp,
   createAddLayerOp,
@@ -111,9 +109,7 @@ import { clampBBox, padBBox, strokesBBox, unionBBox } from '../engine/geom';
 import { compositeToCanvas, compositeRegionToCanvas } from './render';
 import { bufferToDataURL } from './thumbnail';
 import { reorderIndex } from './layerDnd';
-import { describeOp } from './opLabel';
 import { ColorPicker } from './ColorPicker';
-import { ConfirmButton } from './ConfirmButton';
 import { FloatWindow, Section } from './Float';
 import { ToolIcon, type ToolIconName } from './ToolIcon';
 import { drawMarchingAnts, antsDash, ANTS_STEPS } from './marchingAnts';
@@ -130,8 +126,7 @@ type Tool =
   | 'line'
   | 'rect'
   | 'lassoSelect'
-  | 'transform'
-  | 'inspect';
+  | 'transform';
 
 interface ToolDef {
   id: Tool;
@@ -189,13 +184,6 @@ const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
         hint: '囲った内側だけ描けるようにする（Shift=追加 / Alt=削除 / Shift+Alt=交差）',
       },
       { id: 'transform', label: '変形', key: 'V', icon: 'transform', hint: '移動・拡大縮小・回転' },
-      {
-        id: 'inspect',
-        label: '履歴しらべ',
-        key: 'Q',
-        icon: 'inspect',
-        hint: '矩形で囲った範囲に関わる操作を履歴からハイライト（選択範囲ではない）',
-      },
     ],
   },
 ];
@@ -413,8 +401,6 @@ export function CanvasEditor({
   height,
   version,
   onEdit,
-  highlightRegion,
-  onRegionSelect,
   onLoadPsdDocument,
 }: {
   session: EditorSession;
@@ -422,17 +408,8 @@ export function CanvasEditor({
   height: number;
   version: number;
   onEdit: () => void;
-  highlightRegion: BBox | null;
-  onRegionSelect: (bbox: BBox) => void;
   onLoadPsdDocument: (w: number, h: number, ops: readonly Operation[]) => void;
 }) {
-  // Replayer は「元サイズ（session 生成時のサイズ）」の初期状態から log を replay する。キャンバス
-  // リサイズは log 上の canvasSize op で表現されるので、元サイズから replay すれば現在サイズへ到達し、
-  // Verify（replay とライブ状態のビット一致）が成立する。現在の width/height（プロップ）ではなく
-  // 不変の session.width/height を使うのが肝心（現在サイズで作り直すと base レイヤ寸法がずれて Verify 失敗）。
-  const replayerRef = useRef<Replayer | null>(null);
-  if (!replayerRef.current) replayerRef.current = new Replayer(session.width, session.height);
-
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const paneRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -462,7 +439,6 @@ export function CanvasEditor({
   // ストリーク開始時（最初の変形 op を適用する直前）の状態。継続ジェスチャは全ログ replay せず
   // applyOperation(baseState, op) で元バッファから1回だけ再サンプルし直す（確定の重さ対策）。
   const xformBaseStateRef = useRef<EditorState | null>(null);
-  const selectRef = useRef<{ startX: number; startY: number } | null>(null);
   const shapeRef = useRef<{ startX: number; startY: number } | null>(null);
   // 投げ縄（選択 / 塗り）のドラッグ中。点列はキャンバス座標の平坦配列 [x0,y0,x1,y1,...]。
   // 離した時点で 1 op（setSelection / lassoFill）として確定する = Undo 1 回で元に戻る。
@@ -588,8 +564,6 @@ export function CanvasEditor({
   const [swipingStackId, setSwipingStackId] = useState<string | null>(null);
   // カルーセルの帯。指の動きに毎フレーム追従させるので、再レンダーを挟まず transform を直接書く。
   const carouselTrackRef = useRef<HTMLDivElement>(null);
-  const [histIndex, setHistIndex] = useState<number | null>(null);
-  const [verify, setVerify] = useState<{ ok: boolean; msg: string } | null>(null);
   const [hovering, setHovering] = useState(false);
   const [zoom, setZoom] = useState(1);
   // パン(視点移動)は scroll ではなく transform で行う（キャンバスが画面に収まっていても動かせる）。
@@ -615,7 +589,6 @@ export function CanvasEditor({
   // ドラッグ中の不透明度プレビュー（再レンダーを介さず合成へ反映するため ref）。
   const opacityPreviewRef = useRef<{ layerId: string; opacity: number } | null>(null);
 
-  const previewing = histIndex !== null;
   // 筆で描くツール（= brush op を出す）。line/rect も同じ経路だが形状ツールとして別扱い。
   const PAINT_TOOLS: Tool[] = ['brush', 'gpen', 'pencil', 'airbrush'];
   const isPaintTool = (t: Tool) => PAINT_TOOLS.includes(t);
@@ -661,23 +634,6 @@ export function CanvasEditor({
   // アートボードは常に1枚、stage 原点(0,0)に置く。
   const focusX = 0;
   const focusY = 0;
-
-  const drawHighlight = (c: HTMLCanvasElement) => {
-    if (!highlightRegion || highlightRegion.w <= 0 || highlightRegion.h <= 0) return;
-    const ctx = c.getContext('2d');
-    if (!ctx) return;
-    ctx.save();
-    ctx.strokeStyle = '#ffd60a';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 4]);
-    ctx.strokeRect(
-      highlightRegion.x + 0.5,
-      highlightRegion.y + 0.5,
-      Math.max(1, highlightRegion.w - 1),
-      Math.max(1, highlightRegion.h - 1),
-    );
-    ctx.restore();
-  };
 
   // 表示用 state（不透明度プレビューを一時的に上書き。ツリー対応）。
   const displayState = (): EditorState => {
@@ -738,9 +694,8 @@ export function CanvasEditor({
 
   const repaint = () => {
     const c = canvasRef.current;
-    if (!c || previewing) return;
+    if (!c) return;
     compositeToCanvas(c, displayState());
-    drawHighlight(c);
     if (tool === 'transform' && activeContentBBox) drawXformBox(c, bboxCorners(activeContentBBox));
   };
 
@@ -748,7 +703,7 @@ export function CanvasEditor({
   // 4K 以上でも編集の確定・不透明度変更・undo/redo が軽い。region が無い/広すぎる場合は全面にフォールバック。
   const repaintRegion = (region: BBox | null) => {
     const c = canvasRef.current;
-    if (!c || previewing) return;
+    if (!c) return;
     if (!region) return repaint();
     const pad = 2; // AA・境界の取りこぼし対策に少しだけ広げる
     const x0 = Math.max(0, Math.floor(region.x - pad));
@@ -759,21 +714,19 @@ export function CanvasEditor({
     const rh = y1 - y0;
     if (rw <= 0 || rh <= 0) {
       // アートボード内に可視の変化なし。overlay だけ描き直す。
-      drawHighlight(c);
       if (tool === 'transform' && activeContentBBox) drawXformBox(c, bboxCorners(activeContentBBox));
       return;
     }
     // 領域が広いと windowing のオーバーヘッドが勝るので素直に全面。
     if (rw * rh >= width * height * 0.6) return repaint();
     compositeRegionToCanvas(c, displayState(), x0, y0, rw, rh);
-    drawHighlight(c);
     if (tool === 'transform' && activeContentBBox) drawXformBox(c, bboxCorners(activeContentBBox));
   };
 
   // ブラシ/消しゴムの確定描画は全画面 flatten で、キャンバスが大きい・レイヤが多いほど重い（数十ms）。
   // これをストロークごと（pointer up 毎）に走らせると 1 本ごとに固まる。連続描画中はプレビュー最終
   // フレームが表示を担えるので、確定 flatten は「少しアイドルしてから 1 回だけ」に間引く（バーストを 1
-  // 回にまとめる）。session.state は即時正しいので board/verify 等には影響しない（表示だけ 90ms 遅延）。
+  // 回にまとめる）。session.state は即時正しいので編集内容や書き出しには影響しない（表示だけ 90ms 遅延）。
   const deferExactRef = useRef(false);
   const exactTimerRef = useRef<number | null>(null);
   // 次の再描画で「変化した矩形」だけを描き直すためのヒント。null=未指定、'full'=全面必須、BBox=その領域。
@@ -809,21 +762,14 @@ export function CanvasEditor({
     if (liftTimerRef.current !== null) clearTimeout(liftTimerRef.current);
   }, []);
 
-  // 新しいドキュメント（別 session）になったときだけ Replayer を作り直す。session.width/height は
-  // その doc の元サイズで不変なので、リサイズ（canvasSize op）では作り直さない。
-  useEffect(() => {
-    replayerRef.current = new Replayer(session.width, session.height);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
-
-  // マウント時・編集後(version)・選択ハイライト変更時・サイズ変更時に再描画。
+  // マウント時・編集後(version)・サイズ変更時に再描画。
   // ブラシ確定バースト中（deferExactRef）はプレビューが表示を担うので、全画面 flatten は間引く。
   // 編集ハンドラが markDirty で領域を指定していれば、その矩形だけを部分再描画する（未指定なら全面）。
   useEffect(() => {
     if (deferExactRef.current) return;
     flushDirtyRepaint();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version, highlightRegion, width, height]);
+  }, [version, width, height]);
 
   // ツール・アクティブレイヤー変更時に再描画（Transform 枠の表示有無が変わる）。
   useEffect(() => {
@@ -845,7 +791,7 @@ export function CanvasEditor({
     xformBaseStateRef.current = null;
   }, [tool, activeLayerId]);
 
-  // checkout 等でアクティブレイヤが存在しなくなったら現在状態の active に合わせる。
+  // Undo/Redo 等でアクティブレイヤが存在しなくなったら現在状態の active に合わせる。
   // 選択（操作ボタンの対象）も消えていたら描き先へ寄せる（押した先が無いボタンを残さない）。
   useEffect(() => {
     if (!getNode(session.state, activeLayerId)) {
@@ -858,7 +804,6 @@ export function CanvasEditor({
   }, [version]);
 
   const doUndo = () => {
-    if (previewing) return;
     if (session.undo()) {
       markDirty(session.lastDirtyRegion ?? 'full'); // 変化領域が分かれば部分再描画
       onEdit(); // version 効果が flushDirtyRepaint（部分/全面）を実行する
@@ -866,7 +811,6 @@ export function CanvasEditor({
   };
 
   const doRedo = () => {
-    if (previewing) return;
     if (session.redo()) {
       markDirty(session.lastDirtyRegion ?? 'full');
       onEdit();
@@ -919,7 +863,6 @@ export function CanvasEditor({
       case 'r': case 'R': setTool('rect'); break;
       case 'm': case 'M': setTool('lassoSelect'); break;
       case 'v': case 'V': setTool('transform'); break;
-      case 'q': case 'Q': setTool('inspect'); break;
       case 'x': case 'X': toggleMainSub(); break;
       case 'c': case 'C': toggleTransparent(); break;
       // いま描いているレイヤーが属するスロットの差分を往復する（A/B をパタパタ見比べる）。
@@ -1208,11 +1151,9 @@ export function CanvasEditor({
     if (!c) return;
     if (strokes.length === 0) {
       compositeToCanvas(c, displayState());
-      drawHighlight(c);
       return;
     }
     compositeToCanvas(c, applyOperation(session.state, strokeOp(strokes)));
-    drawHighlight(c);
   };
 
   /**
@@ -1229,18 +1170,6 @@ export function CanvasEditor({
           width,
           height,
         );
-
-  const drawSelectionPreview = (x0: number, y0: number, x1: number, y1: number) => {
-    const c = canvasRef.current!;
-    compositeToCanvas(c, session.state);
-    const ctx = c.getContext('2d')!;
-    ctx.save();
-    ctx.strokeStyle = '#56ccf2';
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 3]);
-    ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
-    ctx.restore();
-  };
 
   // ---- 選択範囲オーバーレイ（マーチングアンツ）と投げ縄のプレビュー ----------------
   // 絵の canvas とは別の重ね canvas に描く。点線を動かしても・投げ縄をドラッグしても
@@ -1268,7 +1197,7 @@ export function CanvasEditor({
 
     // 確定済みの選択範囲＝マーチングアンツ（流れる点線）。描き方は marchingAnts.ts に集約。
     drawMarchingAnts(ctx, {
-      loops: previewing ? [] : selectionOutline(),
+      loops: selectionOutline(),
       zoom: z,
       phase: antsPhaseRef.current,
       width,
@@ -1298,24 +1227,24 @@ export function CanvasEditor({
     }
   };
 
-  // 選択の変化・ズーム・履歴閲覧の切り替え・キャンバスサイズ変更でオーバーレイを描き直す
+  // 選択の変化・ズーム・キャンバスサイズ変更でオーバーレイを描き直す
   // （canvas の width/height を変えると中身が消えるので、サイズ変更後も描き直しが要る）。
   useEffect(() => {
     drawOverlay();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectionMask, zoom, previewing, width, height]);
+  }, [selectionMask, zoom, width, height]);
 
-  // 点線を流す。選択が無いとき／履歴閲覧中は止める（無駄な描画をしない）。
+  // 点線を流す。選択が無いときは止める（無駄な描画をしない）。
   // 1 ティックで破線 1 本ぶんの 1/ANTS_STEPS だけ進み、2×ANTS_STEPS ティックで元の見た目に戻る。
   useEffect(() => {
-    if (previewing || !selectionMask) return;
+    if (!selectionMask) return;
     const t = window.setInterval(() => {
       antsPhaseRef.current = (antsPhaseRef.current + 1) % (ANTS_STEPS * 2);
       drawOverlay();
     }, 70);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectionMask, previewing]);
+  }, [selectionMask]);
 
   /** 修飾キー → 既存選択との合成方法（Photoshop 等と同じ割り当て）。 */
   const selectionModeOf = (e: { shiftKey: boolean; altKey: boolean }): SelectionMode =>
@@ -1336,7 +1265,7 @@ export function CanvasEditor({
   const commitLasso = () => {
     const la = lassoRef.current;
     lassoRef.current = null;
-    if (!la || previewing) {
+    if (!la) {
       drawOverlay();
       return;
     }
@@ -1370,7 +1299,7 @@ export function CanvasEditor({
 
   /** 選択を解除する（1 op としてログに積むので Undo で戻せる）。 */
   const clearSelection = () => {
-    if (previewing || !session.state.selection) return;
+    if (!session.state.selection) return;
     markDirty({ x: 0, y: 0, w: 0, h: 0 });
     session.apply(createClearSelectionOp(width, height));
     onEdit();
@@ -1403,7 +1332,6 @@ export function CanvasEditor({
   // 塗りつぶし: 影響領域を先に算出して region に渡し、fill 操作を適用する。
   // 透明色のときは同じ領域のアルファを削る（＝連結領域を透明にする）。
   const doFill = (x: number, y: number) => {
-    if (previewing) return;
     const region = fillRegion(session.state, activeLayerId, x, y, tolerance);
     if (region.w <= 0 || region.h <= 0) return; // 種点がレイヤ外 → 何もしない（空opを残さない）
     markDirty(region);
@@ -1803,7 +1731,6 @@ export function CanvasEditor({
       if (rw > 0 && rh > 0) compositeRect(rx, ry, rw, rh);
     }
     pv.dirty = null; // 反映済み。次フレームぶんを新たに積算する。
-    drawHighlight(c); // 外周だけの軽い上書き（clip した矩形が横切っても全体を描き直して復元）。
   };
 
   const scheduleBrushPreview = () => {
@@ -1889,7 +1816,6 @@ export function CanvasEditor({
       c.style.cursor = 'crosshair';
       return;
     }
-    if (previewing) return;
     const c = canvasRef.current!;
     capturePointer(c, e.pointerId);
     const pt = getPoint(e);
@@ -1934,8 +1860,6 @@ export function CanvasEditor({
       }
       buildXformPreview(); // ドラッグ中の高速プレビュー用に下地/上層/本体を1度だけ焼く
       c.style.cursor = hit.mode === 'rotate' ? 'grabbing' : xformCursor(hit);
-    } else if (tool === 'inspect') {
-      selectRef.current = { startX: pt.x, startY: pt.y };
     } else if (tool === 'lassoSelect' || tool === 'lassoFill') {
       lassoRef.current = {
         pts: [pt.x, pt.y],
@@ -1993,7 +1917,7 @@ export function CanvasEditor({
       if (!hovering) setHovering(true);
     }
     // Transform ツールのホバー: 位置に応じてカーソルを変える（再レンダーを避け DOM 直接更新）。
-    if (tool === 'transform' && !xformRef.current && !previewing) {
+    if (tool === 'transform' && !xformRef.current) {
       const c = canvasRef.current;
       if (c) {
         const pt = getPoint(e);
@@ -2037,9 +1961,6 @@ export function CanvasEditor({
         g.matrix = buildMatrix(1, deg, g.pivot);
       }
       scheduleXformPreview();
-    } else if (selectRef.current) {
-      const pt = getPoint(e);
-      drawSelectionPreview(selectRef.current.startX, selectRef.current.startY, pt.x, pt.y);
     } else if (lassoRef.current) {
       // 中間サンプルも全部拾ってから間引く（速く動かしても輪郭がカクつかない）。
       for (const pt of getCoalescedPoints(e)) pushLassoPoint(pt.x, pt.y);
@@ -2126,19 +2047,6 @@ export function CanvasEditor({
       } else {
         repaint();
       }
-    } else if (selectRef.current) {
-      const pt = getPoint(e);
-      const x0 = selectRef.current.startX;
-      const y0 = selectRef.current.startY;
-      selectRef.current = null;
-      const bbox: BBox = {
-        x: Math.min(x0, pt.x),
-        y: Math.min(y0, pt.y),
-        w: Math.abs(pt.x - x0),
-        h: Math.abs(pt.y - y0),
-      };
-      if (bbox.w > 2 && bbox.h > 2) onRegionSelect(bbox);
-      repaint();
     } else if (lassoRef.current) {
       const pt = getPoint(e);
       pushLassoPoint(pt.x, pt.y);
@@ -2161,7 +2069,6 @@ export function CanvasEditor({
 
   // brightness/hue は「相対調整(delta)を1クリック=1操作」。影響範囲はレイヤ内容のbbox。
   const adjustBrightness = (delta: number) => {
-    if (previewing) return;
     const layer = getActiveLayer();
     const region = layer ? layerContentBBox(layer) : undefined;
     if (region) markDirty(region);
@@ -2170,7 +2077,6 @@ export function CanvasEditor({
   };
 
   const adjustHue = (shift: number) => {
-    if (previewing) return;
     const layer = getActiveLayer();
     const region = layer ? layerContentBBox(layer) : undefined;
     if (region) markDirty(region);
@@ -2275,7 +2181,6 @@ export function CanvasEditor({
   };
 
   const applyRotate90 = (dir: 1 | -1) => {
-    if (previewing) return;
     const layer = getActiveLayer();
     const pivot = layer ? pivotOf(layer) : null;
     if (!layer || !pivot) return;
@@ -2283,7 +2188,6 @@ export function CanvasEditor({
   };
 
   const applyFlip = (axis: 'h' | 'v') => {
-    if (previewing) return;
     const layer = getActiveLayer();
     const pivot = layer ? pivotOf(layer) : null;
     if (!layer || !pivot) return;
@@ -2293,7 +2197,6 @@ export function CanvasEditor({
   };
 
   const addLayer = () => {
-    if (previewing) return;
     const id = genId('layer');
     const name = `Layer ${session.state.layers.length}`;
     session.apply(createAddLayerOp(id, name, width, height));
@@ -2305,7 +2208,6 @@ export function CanvasEditor({
   // 画像を新規レイヤとして読み込む。キャンバスに収まるよう縮小し、中央に配置する。
   // 画素は addImageLayer 操作に焼き込まれ、log だけから決定的に再構築できる。
   const importImage = (file: File) => {
-    if (previewing) return;
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
@@ -2341,7 +2243,6 @@ export function CanvasEditor({
   // を保持）。全レイヤーは1回の Undo 単位（applyBatch）で構築され、画素は各操作へ焼き込まれるので
   // log から決定的に replay できる。実際のセッション作り直しは App 側（onLoadPsdDocument）が担う。
   const importPsd = async (file: File) => {
-    if (previewing) return;
     try {
       const buffer = await file.arrayBuffer();
       // ag-psd は大きいので初回インポート時だけ動的ロード（初期表示を軽く保つ）。
@@ -2391,9 +2292,8 @@ export function CanvasEditor({
 
   // キャンバス（アートボード）サイズを変更する。非破壊: レイヤーの buffer/offset は触らず、クリップ範囲
   // （アートボード矩形）だけを canvasSize op で変える。縮小=枠外に隠れる / 拡大=再び現れる（内容は消えない）。
-  // op として log に積むので Undo でき、Verify(replay 一致) も保たれる。
+  // op として log に積むので Undo できる。
   const changeCanvasSize = (w: number, h: number) => {
-    if (previewing) return;
     const cw = Math.max(1, Math.min(MAX_CANVAS_DIM, Math.round(w)));
     const ch = Math.max(1, Math.min(MAX_CANVAS_DIM, Math.round(h)));
     if (!Number.isFinite(cw) || !Number.isFinite(ch)) return;
@@ -2424,7 +2324,6 @@ export function CanvasEditor({
   };
 
   const onResizeHandleDown = (axis: 'w' | 'h', e: ReactPointerEvent) => {
-    if (previewing) return;
     e.preventDefault();
     e.stopPropagation();
     capturePointer(e.currentTarget as HTMLElement, e.pointerId);
@@ -2516,7 +2415,6 @@ export function CanvasEditor({
     t.node.visible === false ? t.node : t.slot;
 
   const toggleVisibility = (n: LayerNode) => {
-    if (previewing) return;
     session.apply(createSetLayerVisibilityOp(n.id, !n.visible, nodeRegion(n)));
     onEdit();
     repaint();
@@ -2530,7 +2428,7 @@ export function CanvasEditor({
     return !!info && info.index > 0;
   };
   const toggleClip = (n: LayerNode) => {
-    if (previewing || isGroup(n)) return;
+    if (isGroup(n)) return;
     session.apply(createSetLayerClippingOp(n.id, !n.clipped, nodeRegion(n)));
     onEdit();
     repaint();
@@ -2539,7 +2437,6 @@ export function CanvasEditor({
   // 合成方法（いまは 通常 ⇄ 乗算 のトグル）。リーフ・フォルダどちらにも効く。
   // フォルダに掛けると、そのフォルダの合成結果まるごとが下地に掛かる（＝影のフォルダを一括で乗算）。
   const toggleMultiply = (n: LayerNode) => {
-    if (previewing) return;
     const next = n.blendMode === 'multiply' ? 'normal' : 'multiply';
     session.apply(createSetLayerBlendModeOp(n.id, next, nodeRegion(n)));
     onEdit();
@@ -2547,7 +2444,6 @@ export function CanvasEditor({
   };
 
   const deleteLayer = (n: LayerNode) => {
-    if (previewing) return;
     if (leafCount() - collectLeafIds(n).length < 1) return; // 最低1リーフを残す
     session.apply(createRemoveLayerOp(n.id, nodeRegion(n)));
     setActiveLayerId(session.state.activeLayerId);
@@ -2559,7 +2455,6 @@ export function CanvasEditor({
   // 縦軸（z 順）に対して、同じスロットに互いに排他な差分を左右へ並べる。増やす対象は
   // アクティブレイヤーの居るスロット。既に横軸なら右隣へ、まだなら その場で横軸化して 2 つ目にする。
   const addVariant = (copy: boolean) => {
-    if (previewing) return;
     const t = opTarget();
     if (!t) return;
     const target = t.node;
@@ -2585,7 +2480,6 @@ export function CanvasEditor({
    * 空スロットなら、無いことが横並びの 1 枚として見え、状態の所属先にもなれる（規則4 の実体）。
    */
   const addEmptySlot = () => {
-    if (previewing) return;
     const t = opTarget();
     if (!t) return;
     markDirty('full');
@@ -2608,7 +2502,6 @@ export function CanvasEditor({
 
   // いま出ている差分を捨てる。残り 1 つになったら横軸は解け、素のレイヤーに戻る。
   const removeVariant = (stack: LayerGroup, variant: LayerNode) => {
-    if (previewing) return;
     // 差分が 1 つしか残っていない退化スタックはスロットごと消す。
     if (stack.children.length < 2) {
       deleteLayer(stack);
@@ -2623,7 +2516,6 @@ export function CanvasEditor({
 
   // レイヤーの内容を全消去（透明化）。レイヤー自体は残る。1操作として記録され Undo 可能。
   const clearLayerContent = (layer: Layer) => {
-    if (previewing) return;
     session.apply(createClearLayerOp(layer.id, width, height, layerContentBBox(layer)));
     onEdit();
     repaint();
@@ -2640,7 +2532,7 @@ export function CanvasEditor({
     return !isGroup(info.siblings[info.index - 1]);
   };
   const mergeDown = (n: LayerNode) => {
-    if (previewing || !canMergeDown(n)) return;
+    if (!canMergeDown(n)) return;
     const info = getParentInfo(session.state, n.id)!;
     const lower = info.siblings[info.index - 1] as Layer;
     const region = unionBBox(layerContentBBox(n as Layer), layerContentBBox(lower));
@@ -2710,7 +2602,6 @@ export function CanvasEditor({
   const onRowPointerDown = (n: LayerNode, e: ReactPointerEvent) => {
     // 新しいジェスチャの開始。前のジェスチャの「クリックを飲む」フラグはここで必ず落とす。
     gestureConsumedRef.current = false;
-    if (previewing) return;
     if (e.button !== 0) return; // 主ボタン（左/ペン接地）のみ
     const el = e.target as HTMLElement | null;
     if (el && el.closest('button, input, textarea, select, [contenteditable="true"]')) return;
@@ -2734,7 +2625,7 @@ export function CanvasEditor({
   // クリックで確定する。覗き見の間は state を一切触らず displayState() で差し替えるだけなので、
   // 見比べても履歴は汚れない（確定して初めて 1 op = Undo 1 回になる）。
   const peekVariant = (stack: LayerGroup, index: number) => {
-    if (previewing || dragIdRef.current) return; // 並べ替えドラッグ中に覗き見が割り込まないように
+    if (dragIdRef.current) return; // 並べ替えドラッグ中に覗き見が割り込まないように
     const base = variantIndexOf(stack);
     if (index === base) {
       clearVariantPeek(); // 出ているものへ戻ってきた
@@ -2797,7 +2688,7 @@ export function CanvasEditor({
   const chooseVariant = (stack: LayerGroup, index: number) => {
     variantPeekRef.current = null;
     setVariantPeek(null);
-    if (previewing || index === variantIndexOf(stack) || index < 0) {
+    if (index === variantIndexOf(stack) || index < 0) {
       repaint(); // 覗き見をやめるだけ
       return;
     }
@@ -2839,14 +2730,12 @@ export function CanvasEditor({
 
   /** 状態を 1 つ作る。この時点では何も所属していない（空のレールが 1 本立つだけ）。 */
   const addState = () => {
-    if (previewing) return;
     session.apply(createAddStateOp(genId('state'), `ver${listStates(session.state).length + 1}`));
     onEdit();
   };
 
   /** 状態を消す。付いていた所属が一斉に外れるだけで、スロットは 1 つも消えない（規則7）。 */
   const deleteState = (st: VariantState) => {
-    if (previewing) return;
     if (editingStateId === st.id) setEditingStateId(null);
     session.apply(createRemoveStateOp(st.id));
     onEdit();
@@ -2870,7 +2759,6 @@ export function CanvasEditor({
    * これが 1 操作で済むかどうかが、この設計の一番の見どころ。
    */
   const applyStateNow = (st: VariantState) => {
-    if (previewing) return;
     markDirty('full'); // 複数行の差分が入れ替わるので絵の全面が変わりうる
     session.apply(createApplyStateOp(st.id));
     setActiveLayerId(session.state.activeLayerId);
@@ -2885,7 +2773,6 @@ export function CanvasEditor({
    * 「いま出ているスロット」を宛先にするので、行に見えているものと結果が一致する。
    */
   const toggleAttachment = (stateId: string, rowId: string) => {
-    if (previewing) return;
     const t = attachTarget(session.state, rowId);
     if (!t) return;
     const cur = liveAttachment(session.state, stateId, t.stack.id);
@@ -2989,7 +2876,7 @@ export function CanvasEditor({
     dragOriginRef.current = null;
     setDragGhost(null);
     setDropHint(null);
-    if (previewing || !dragged) return;
+    if (!dragged) return;
     if (hint) {
       performDrop(dragged, hint.id, hint.pos);
       return;
@@ -3007,7 +2894,7 @@ export function CanvasEditor({
   };
 
   const performDrop = (draggedId: string, targetId: string, pos: DropPos) => {
-    if (previewing || draggedId === targetId) return;
+    if (draggedId === targetId) return;
     const dn = getNode(session.state, draggedId);
     const tn = getNode(session.state, targetId);
     if (!dn || !tn || collectNodeIds(dn).includes(targetId)) return; // 子孫へは不可
@@ -3048,7 +2935,6 @@ export function CanvasEditor({
    * 1 ドロップ = 1 op なので Undo 1 回で元の縦積みに戻る。
    */
   const dropBesideAsVariant = (draggedId: string, targetId: string, side: 'left' | 'right') => {
-    if (previewing) return;
     markDirty('full'); // 差分の入れ替えは絵の全面が変わりうる
     session.apply(createMoveAsVariantOp(draggedId, targetId, genId('vstack'), side));
     setActiveLayerId(session.state.activeLayerId);
@@ -3058,7 +2944,6 @@ export function CanvasEditor({
   // 既存のレイヤーをスロットへ落として「そのスロットの差分」にする。
   // 落としたものをそのまま表示中の差分にするので、結果が即座に見える。
   const dropAsVariant = (draggedId: string, stack: LayerGroup) => {
-    if (previewing) return;
     const at = variantIndexOf(stack);
     const already = stack.children.findIndex((c) => c.id === draggedId);
     markDirty('full');
@@ -3078,7 +2963,6 @@ export function CanvasEditor({
   // ノードを newParentId（null=最上位）の index へ移す（並べ替え / フォルダ出し入れ）。全ノードが
   // 1つのキャンバス座標系を共有するので、内容(offset)は動かさず z 順/親だけを付け替える非破壊操作。
   const moveNode = (draggedId: string, newParentId: string | null, index: number) => {
-    if (previewing) return;
     const dn = getNode(session.state, draggedId);
     if (!dn) return;
     markDirty('full');
@@ -3109,7 +2993,6 @@ export function CanvasEditor({
 
   // 空フォルダを最上位に追加。
   const addFolder = () => {
-    if (previewing) return;
     session.apply(createAddGroupOp(genId('group'), `Folder ${session.state.layers.length}`));
     onEdit();
     repaint();
@@ -3125,7 +3008,6 @@ export function CanvasEditor({
   const onOpacityInput = (n: LayerNode, v: number) => {
     setOpacityDraft({ id: n.id, v });
     opacityPreviewRef.current = { layerId: n.id, opacity: v };
-    if (previewing) return;
     // スライダー移動のたびに全面 flatten していたのを、そのレイヤーの内容 bbox だけの部分再描画にする
     // （4K でもドラッグが軽い）。グループは footprint 不定なので全面。
     const region = nodeRegion(n);
@@ -3544,59 +3426,12 @@ export function CanvasEditor({
     );
   };
 
-  // Reset = 履歴の畳み込み。現在の絵（レイヤー構造）は残し、log・revisions・undo だけを捨てる。
-  const reset = () => {
-    session.flattenToBaseline();
-    setActiveLayerId(session.state.activeLayerId);
-    setHistIndex(null);
-    setVerify(null);
-    onEdit();
-    repaint();
-  };
-
-  const log = session.getLog();
-
   // 状態の一覧と、レールを引くために左に空ける幅。状態が 0 本なら幅も 0 で、
   // 状態を作っていないうちはレイヤーパネルの見た目が今までとまったく変わらない。
   const stateList = listStates(session.state);
   const railGutterW = stateList.length
     ? RAIL_PAD_L + (stateList.length - 1) * RAIL_PITCH + RAIL_KNOB_R + RAIL_PAD_R
     : 0;
-
-  const onScrub = (k: number) => {
-    if (k >= log.length) {
-      setHistIndex(null);
-      // setHistIndex は次レンダーで反映されるため、ここで即ライブ描画する。
-      const c = canvasRef.current;
-      if (c) {
-        compositeToCanvas(c, session.state);
-        drawHighlight(c);
-      }
-    } else {
-      setHistIndex(k);
-      compositeToCanvas(canvasRef.current!, replayerRef.current!.replay(log, k));
-    }
-  };
-
-  const returnToLatest = () => {
-    setHistIndex(null);
-    const c = canvasRef.current;
-    if (c) {
-      compositeToCanvas(c, session.state);
-      drawHighlight(c);
-    }
-  };
-
-  const runVerify = () => {
-    const replayed = replayerRef.current!.replay(session.getLog());
-    const ok = statesEqual(replayed, session.state);
-    setVerify({
-      ok,
-      msg: ok
-        ? `OK — ${log.length} 操作の replay がライブ状態とビット一致`
-        : 'NG — replay がライブ状態と不一致',
-    });
-  };
 
   return (
     <div className="editor" ref={paneRef}>
@@ -3654,33 +3489,29 @@ export function CanvasEditor({
           <div ref={resizeOutlineRef} className="resize-outline" style={{ display: 'none' }} />
 
           {/* 辺リサイズ・ハンドル（右辺＝幅 / 下辺＝高さ）。掴んで引っ張るとサイズが変わる（離すと確定）。
-              canvas-stage 内なので pan に追従し、scale の外なので見た目サイズは一定。履歴閲覧中は隠す。 */}
-          {!previewing && (
-            <>
-              <div
-                className="resize-handle resize-handle-right"
-                style={{ left: width * zoom, top: (height * zoom) / 2 }}
-                title="ドラッグで幅を変更（内容は消えません）"
-                onPointerDown={(e) => onResizeHandleDown('w', e)}
-                onPointerMove={onResizeHandleMove}
-                onPointerUp={onResizeHandleUp}
-                onPointerCancel={onResizeHandleUp}
-              >
-                <span className="resize-grip">⇔</span>
-              </div>
-              <div
-                className="resize-handle resize-handle-bottom"
-                style={{ left: (width * zoom) / 2, top: height * zoom }}
-                title="ドラッグで高さを変更（内容は消えません）"
-                onPointerDown={(e) => onResizeHandleDown('h', e)}
-                onPointerMove={onResizeHandleMove}
-                onPointerUp={onResizeHandleUp}
-                onPointerCancel={onResizeHandleUp}
-              >
-                <span className="resize-grip">⇕</span>
-              </div>
-            </>
-          )}
+              canvas-stage 内なので pan に追従し、scale の外なので見た目サイズは一定。 */}
+          <div
+            className="resize-handle resize-handle-right"
+            style={{ left: width * zoom, top: (height * zoom) / 2 }}
+            title="ドラッグで幅を変更（内容は消えません）"
+            onPointerDown={(e) => onResizeHandleDown('w', e)}
+            onPointerMove={onResizeHandleMove}
+            onPointerUp={onResizeHandleUp}
+            onPointerCancel={onResizeHandleUp}
+          >
+            <span className="resize-grip">⇔</span>
+          </div>
+          <div
+            className="resize-handle resize-handle-bottom"
+            style={{ left: (width * zoom) / 2, top: height * zoom }}
+            title="ドラッグで高さを変更（内容は消えません）"
+            onPointerDown={(e) => onResizeHandleDown('h', e)}
+            onPointerMove={onResizeHandleMove}
+            onPointerUp={onResizeHandleUp}
+            onPointerCancel={onResizeHandleUp}
+          >
+            <span className="resize-grip">⇕</span>
+          </div>
         </div>
       </div>
 
@@ -3690,7 +3521,7 @@ export function CanvasEditor({
         style={{
           width: size * zoom,
           height: size * zoom,
-          display: showCursor && hovering && !previewing ? 'block' : 'none',
+          display: showCursor && hovering ? 'block' : 'none',
           // 消す一筆（消しゴム or 透明色）は白いリングで「色を置かない」ことを示す。
           borderColor: sizeAdjust ? '#56ccf2' : erasing ? '#fff' : color,
         }}
@@ -3709,14 +3540,7 @@ export function CanvasEditor({
         )}
       </div>
 
-      {previewing && (
-        <div className="preview-banner">
-          履歴を閲覧中（読み取り専用）— step {histIndex}/{log.length}
-          <button onClick={returnToLatest}>最新に戻る</button>
-        </div>
-      )}
-
-      {/* キャンバス下部のフロートバー: ズーム + 履歴スクラブ */}
+      {/* キャンバス下部のフロートバー: ズーム・視点移動 */}
       <div className="float-canvasbar">
         <button onClick={() => zoomByCenter(1 / 1.25)} title="縮小">−</button>
         <span className="zoom-val" onClick={resetZoom} title="クリックで100%">
@@ -3731,30 +3555,17 @@ export function CanvasEditor({
         <span className={`keyhint-badge ${spaceHeld ? 'on' : ''}`} title="Space を押しながらドラッグで視点移動">
           Space＝視点移動
         </span>
-        <span className="cb-sep" />
-        <span className="history-label">history</span>
-        <input
-          type="range"
-          min={0}
-          max={log.length}
-          value={histIndex ?? log.length}
-          onChange={(e) => onScrub(Number(e.target.value))}
-          disabled={log.length === 0}
-        />
-        <span className="history-step">
-          {histIndex === null ? `latest (${log.length})` : `${histIndex}/${log.length}`}
-        </span>
       </div>
 
       <FloatWindow id="nrc-tools" title="Tools" defaultPos={{ left: 12, top: 12 }} className="float-tools">
         <Section title="TOOLS" defaultOpen>
           <div className="tool-row">
-            <button onClick={doUndo} disabled={!session.canUndo() || previewing} title="Undo (Ctrl+Z)">
+            <button onClick={doUndo} disabled={!session.canUndo()} title="Undo (Ctrl+Z)">
               <ToolIcon name="undo" size={15} /> Undo
             </button>
             <button
               onClick={doRedo}
-              disabled={!session.canRedo() || previewing}
+              disabled={!session.canRedo()}
               title="Redo (Ctrl+Shift+Z)"
             >
               <ToolIcon name="redo" size={15} /> Redo
@@ -3795,7 +3606,6 @@ export function CanvasEditor({
               <button
                 className="icon-btn"
                 onClick={clearSelection}
-                disabled={previewing}
                 title="選択解除 (Ctrl+D)"
               >
                 <ToolIcon name="deselect" size={14} /> 解除
@@ -3859,7 +3669,7 @@ export function CanvasEditor({
           )}
           <p className="hint">
             B=ブラシ N=Gペン P=鉛筆 A=エア E=消しゴム G=塗りつぶし U=投げ縄塗り I=スポイト
-            L=直線 R=矩形 M=投げ縄選択 V=変形 Q=履歴しらべ／
+            L=直線 R=矩形 M=投げ縄選択 V=変形／
             S押下＋上下ドラッグ or [ ]=サイズ／X=メイン⇄サブ C=透明／, .=差分の切替／
             Ctrl+Z=Undo Ctrl+Shift+Z=Redo Ctrl+D=選択解除
           </p>
@@ -3903,8 +3713,8 @@ export function CanvasEditor({
                   );
                 })}
                 <p className="hint">
-                  数値は描いた瞬間に操作へ焼き込まれます。あとでここを動かしても、
-                  すでに描いた線の見た目は変わりません（Undo/Verify と食い違わないため）。
+                  設定はこれから描く線に適用されます。
+                  すでに描いた線の見た目は変わりません。
                 </p>
               </>
             ) : (
@@ -3940,7 +3750,7 @@ export function CanvasEditor({
               onKeyDown={(e) => e.key === 'Enter' && applyCanvasSize()}
               title="高さ (px)"
             />
-            <button onClick={applyCanvasSize} disabled={previewing} title="このサイズに変更（内容は保持）">
+            <button onClick={applyCanvasSize} title="このサイズに変更（内容は保持）">
               Apply
             </button>
           </div>
@@ -3949,7 +3759,6 @@ export function CanvasEditor({
               <button
                 key={p.label}
                 className={width === p.w && height === p.h ? 'active' : ''}
-                disabled={previewing}
                 onClick={() => {
                   setWDraft(String(p.w));
                   setHDraft(String(p.h));
@@ -4011,7 +3820,7 @@ export function CanvasEditor({
             <span>brightness</span>
             <div className="btn-group">
               {[-40, -10, 10, 40].map((d) => (
-                <button key={d} disabled={previewing} onClick={() => adjustBrightness(d)}>
+                <button key={d} onClick={() => adjustBrightness(d)}>
                   {d > 0 ? `+${d}` : d}
                 </button>
               ))}
@@ -4021,7 +3830,7 @@ export function CanvasEditor({
             <span>hue</span>
             <div className="btn-group">
               {[-45, -15, 15, 45].map((d) => (
-                <button key={d} disabled={previewing} onClick={() => adjustHue(d)}>
+                <button key={d} onClick={() => adjustHue(d)}>
                   {d > 0 ? `+${d}°` : `${d}°`}
                 </button>
               ))}
@@ -4032,16 +3841,16 @@ export function CanvasEditor({
 
         <Section title="TRANSFORM" defaultOpen={false}>
           <div className="tool-row">
-            <button onClick={() => applyRotate90(-1)} disabled={previewing} title="左に90°回転">
+            <button onClick={() => applyRotate90(-1)} title="左に90°回転">
               ⟲ 90°
             </button>
-            <button onClick={() => applyRotate90(1)} disabled={previewing} title="右に90°回転">
+            <button onClick={() => applyRotate90(1)} title="右に90°回転">
               ⟳ 90°
             </button>
-            <button onClick={() => applyFlip('h')} disabled={previewing} title="左右反転">
+            <button onClick={() => applyFlip('h')} title="左右反転">
               Flip H
             </button>
-            <button onClick={() => applyFlip('v')} disabled={previewing} title="上下反転">
+            <button onClick={() => applyFlip('v')} title="上下反転">
               Flip V
             </button>
           </div>
@@ -4049,33 +3858,6 @@ export function CanvasEditor({
             ワンクリック変形（アクティブレイヤー、中心基準）。自由な移動・拡大縮小・回転は
             Transform ツール（V）でキャンバス上の枠をドラッグ。
           </p>
-        </Section>
-
-        <Section title={`LOG (${log.length})`} defaultOpen={false}>
-          <div className="tool-row">
-            <button onClick={runVerify} disabled={log.length === 0}>
-              Verify replay
-            </button>
-            <ConfirmButton
-              onConfirm={reset}
-              idleLabel="Reset"
-              armedLabel={(r) => (r > 1 ? `履歴を消す? あと${r}回` : 'あと1回で確定')}
-              title="編集履歴・revisions・undo を消去し、現在の絵を1枚のベースラインに畳む（絵・レイヤー構造は残る）。3クリックで実行"
-            />
-          </div>
-          {verify && <p className={verify.ok ? 'verify ok' : 'verify ng'}>{verify.msg}</p>}
-          <ol className="op-log">
-            {log.map((op, i) => (
-              <li
-                key={op.id}
-                className={`op op-${op.klass} ${previewing && i >= histIndex! ? 'op-future' : ''}`}
-              >
-                <span className="op-index">{i}</span>
-                <span className="op-type">{op.type}</span>
-                <span className="op-desc">{describeOp(op)}</span>
-              </li>
-            ))}
-          </ol>
         </Section>
       </FloatWindow>
 
@@ -4094,35 +3876,33 @@ export function CanvasEditor({
               label="レイヤー"
               title="新しいレイヤーを最上位に追加して、それを選択・描き先にする"
               onClick={addLayer}
-              disabled={previewing}
             />
             <LayerOpButton
               icon="folderAdd"
               label="フォルダ"
               title="空のフォルダを最上位に追加（行を持ち上げて中央へ落とすと収納できる）"
               onClick={addFolder}
-              disabled={previewing}
             />
             <LayerOpButton
               icon="variantAdd"
               label="差分追加"
               title="選んでいる行の横に、空の差分を増やす（＝そのスロットに横軸を持たせる）。横に並ぶ差分は同時には存在せず、行を左右にスライドして切り替える"
               onClick={() => addVariant(false)}
-              disabled={previewing || !opTarget()}
+              disabled={!opTarget()}
             />
             <LayerOpButton
               icon="variantCopy"
               label="差分複製"
               title="選んでいる行の内容を複製して、その複製を新しい差分として横に増やす（案A を少し変えた案B を作る用）"
               onClick={() => addVariant(true)}
-              disabled={previewing || !opTarget()}
+              disabled={!opTarget()}
             />
             <LayerOpButton
               icon="slotEmpty"
               label="空スロット"
               title="選んでいる行に「何も無い」という差分を足す。これを選べばその行は絵に出ません（＝「非表示にして残す」の置き換え）。状態の所属先にもなるので、「ver1 ではここは無し」を関係として持てます"
               onClick={addEmptySlot}
-              disabled={previewing || !opTarget()}
+              disabled={!opTarget()}
             />
           </div>
           {/* 選んだ 1 行に効く操作。行の中にはボタンを置かず（行は掴む・眺める場所にしておきたい）、
@@ -4180,7 +3960,7 @@ export function CanvasEditor({
                           : '非表示（押すと絵に戻す）'
                     }
                     onClick={() => visTarget && toggleVisibility(visTarget)}
-                    disabled={previewing || !visTarget}
+                    disabled={!visTarget}
                     on={visTarget?.visible === false}
                     tone="off"
                   />
@@ -4199,7 +3979,7 @@ export function CanvasEditor({
                               }）`
                     }
                     onClick={() => node && toggleMultiply(node)}
-                    disabled={previewing || !node || isEmpty}
+                    disabled={!node || isEmpty}
                     on={node?.blendMode === 'multiply'}
                     tone="mul"
                   />
@@ -4216,7 +3996,7 @@ export function CanvasEditor({
                             : '直下にレイヤーが無いためクリップできません'
                     }
                     onClick={() => leaf && toggleClip(leaf)}
-                    disabled={previewing || !clipEnabled}
+                    disabled={!clipEnabled}
                     on={!!leaf?.clipped}
                     tone="clip"
                   />
@@ -4229,7 +4009,7 @@ export function CanvasEditor({
                         : '下に統合できるレイヤーがありません（フォルダ・差分の中は対象外）'
                     }
                     onClick={() => node && mergeDown(node)}
-                    disabled={previewing || !node || !canMergeDown(node)}
+                    disabled={!node || !canMergeDown(node)}
                   />
                   <LayerOpButton
                     icon="layerClear"
@@ -4240,7 +4020,7 @@ export function CanvasEditor({
                         : 'レイヤーを選んでください（フォルダは中身ごとの消去に未対応）'
                     }
                     onClick={() => leaf && clearLayerContent(leaf)}
-                    disabled={previewing || !leaf}
+                    disabled={!leaf}
                   />
                   <LayerOpButton
                     icon="layerDelete"
@@ -4261,7 +4041,7 @@ export function CanvasEditor({
                       if (stack) removeVariant(stack, node);
                       else deleteLayer(node);
                     }}
-                    disabled={previewing || !node || !canDelete}
+                    disabled={!node || !canDelete}
                   />
                 </div>
               </>
@@ -4273,14 +4053,12 @@ export function CanvasEditor({
           <div className="tool-row">
             <button
               onClick={() => imageInputRef.current?.click()}
-              disabled={previewing}
               title="画像ファイルを新規レイヤーとして読み込む（キャンバスに収まるよう縮小して中央に置く）"
             >
               Import
             </button>
             <button
               onClick={() => psdInputRef.current?.click()}
-              disabled={previewing}
               title="PSD を読み込む（PSD 実寸でキャンバスを作成し新規ドキュメントとして開く。レイヤー/フォルダ/クリッピングを保持。ブレンドモード/レイヤーマスクは非対応）"
             >
               PSD
@@ -4326,7 +4104,7 @@ export function CanvasEditor({
                   max={1}
                   step={0.05}
                   value={v}
-                  disabled={!al || previewing}
+                  disabled={!al}
                   onChange={(e) => al && onOpacityInput(al, Number(e.target.value))}
                   onPointerUp={() => al && commitOpacity(al)}
                   onBlur={() => al && commitOpacity(al)}
@@ -4367,7 +4145,6 @@ export function CanvasEditor({
                       className="state-apply"
                       onClick={() => applyStateNow(st)}
                       onDoubleClick={() => startStateRename(st)}
-                      disabled={previewing}
                       title={
                         live.length === 0
                           ? `${st.name} にはまだ何も所属していません（行の左のレールを押してくっつけます）`
@@ -4383,7 +4160,6 @@ export function CanvasEditor({
                   <button
                     className="state-del"
                     onClick={() => deleteState(st)}
-                    disabled={previewing}
                     title="この状態を消す（付いていた所属が一斉に外れるだけで、スロットは 1 つも消えません）"
                   >
                     ✕
@@ -4391,7 +4167,7 @@ export function CanvasEditor({
                 </span>
               );
             })}
-            <button className="state-add" onClick={addState} disabled={previewing} title="状態を作る">
+            <button className="state-add" onClick={addState} title="状態を作る">
               ＋ 状態
             </button>
           </div>

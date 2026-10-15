@@ -51,7 +51,7 @@ export function selectionArea(sel: SelectionMask | null | undefined): number {
   return n;
 }
 
-/** 2つのマスクが同値か（Verify / 再描画判定用）。 */
+/** 2つの選択マスクが同値かを比較する。 */
 export function selectionsEqual(
   a: SelectionMask | null | undefined,
   b: SelectionMask | null | undefined,

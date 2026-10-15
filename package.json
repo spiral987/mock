@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "レイヤー型キャンバスエディタ。決定的な操作ログ（replay 可能）ベースの描画エンジンと Tool UI を持つ素の土台。フォルダ／クリッピングに対応。",
+  "description": "レイヤー・フォルダ・クリッピングに対応したブラウザ用ペイントアプリ。",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
