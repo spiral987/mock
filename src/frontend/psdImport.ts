@@ -29,6 +29,7 @@ import {
   createSetLayerVisibilityOp,
   createSetLayerClippingOp,
   createSetLayerBlendModeOp,
+  createSetGroupCollapsedOp,
 } from '../engine/operations';
 
 export interface PsdImportResult {
@@ -47,11 +48,6 @@ export interface PsdImportResult {
   multiplyCount: number;
   /** 乗算以外のブレンドモードだったため normal に倒したノード数（＝見た目が PSD と違う箇所）。 */
   droppedBlendCount: number;
-  /**
-   * PSD 上で畳まれていたフォルダの id。開閉は log に載せない（見た目しか変わらないものを
-   * op にすると undo を 1 回ぶん食う）ので、op ではなく値として返して UI 側に覚えてもらう。
-   */
-  collapsedGroupIds: string[];
   /** 上限超過で縮小したか（PSD が maxDim より大きいとき true）。 */
   scaled: boolean;
   /** PSD 本来のサイズ。 */
@@ -122,7 +118,6 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
   let clipCount = 0;
   let multiplyCount = 0;
   let droppedBlendCount = 0;
-  const collapsedGroupIds: string[] = [];
 
   /** 合成方法を復元する op を（乗算のときだけ）積む。倒した分は数える。 */
   const pushBlendMode = (nodeId: string, node: PsdLayer): void => {
@@ -148,7 +143,7 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
         const op = normOpacity(node.opacity);
         if (op < 1) ops.push(createSetLayerOpacityOp(groupId, op));
         if (node.hidden) ops.push(createSetLayerVisibilityOp(groupId, false));
-        if (node.opened === false) collapsedGroupIds.push(groupId);
+        if (node.opened === false) ops.push(createSetGroupCollapsedOp(groupId, true));
         pushBlendMode(groupId, node);
         groupCount++;
         addSiblings(node.children, groupId);
@@ -189,7 +184,6 @@ export function buildPsdImportOps(buffer: ArrayBuffer, maxDim = 16384): PsdImpor
     ops,
     leafCount,
     groupCount,
-    collapsedGroupIds,
     clipCount,
     multiplyCount,
     droppedBlendCount,

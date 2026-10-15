@@ -95,9 +95,7 @@ export interface LayerGroup {
   name: string;
   visible: boolean;
   opacity: number; // 0..1
-  // 折りたたみ(collapsed)はここには持たない。見た目にしか影響しない純粋な UI の状態なので、
-  // state に置くと開閉のたびに op が 1 つ積まれ、undo 1 回ぶんを食う（絵は何も変わらないのに）。
-  // 開閉は CanvasEditor がローカルに覚える。
+  collapsed: boolean; // UI 表示の折りたたみ（描画には影響しない）
   children: LayerNode[];
   /**
    * 合成方法（省略 = 'normal'）。グループは子を独立バッファへ合成してから重ねる（isolation）ので、

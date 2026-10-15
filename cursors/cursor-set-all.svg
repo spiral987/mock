@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="168" height="24" viewBox="0 0 168 24" fill="none">
+  <g id="cursor-arrow" transform="translate(0,0)">
+    <path id="arrow" d="M5.2 3 L5.2 19.8 L8.77 16.23 L11.08 21.69 L13.6 20.64 L11.29 15.18 L15.91 15.18 Z"
+      fill="#FFFFFF" stroke="#000000" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+  <g id="cursor-hand" transform="translate(48,0)">
+    <path id="hand" d="M8 12.6 L8 4 A1.5 1.5 0 0 1 11 4 L11 10.6 A1.4 1.4 0 0 1 13.8 10.6 L13.8 11.6 A1.4 1.4 0 0 1 16.6 11.6 L16.6 12.8 A1.2 1.2 0 0 1 19 12.8 L19 16.8 C19 19.7 17.1 21.6 14.3 21.6 L11.2 21.6 C8.6 21.6 6.6 20 5.6 17.6 L4.4 14.6 C3.9 13.4 4.6 12.2 5.9 12.3 Z"
+      fill="#FFFFFF" stroke="#000000" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+  <g id="cursor-text" transform="translate(96,0)">
+    <path id="i-beam" d="M8 3.2 H16 V5.8 H13.5 V18.2 H16 V20.8 H8 V18.2 H10.5 V5.8 H8 Z"
+      fill="#FFFFFF" stroke="#000000" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+  <g id="cursor-crosshair" transform="translate(144,0)">
+    <path id="crosshair" d="M10.7 1.8 H13.3 V10.7 H22.2 V13.3 H13.3 V22.2 H10.7 V13.3 H1.8 V10.7 H10.7 Z"
+      fill="#FFFFFF" stroke="#000000" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+</svg>

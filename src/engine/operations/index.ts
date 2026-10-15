@@ -20,6 +20,7 @@ import {
   mergeDownLayerHandler,
   moveNodeHandler,
   addGroupHandler,
+  setGroupCollapsedHandler,
 } from './layerOps';
 import { fillHandler } from './fill';
 import { lassoFillHandler } from './lassoFill';
@@ -59,6 +60,7 @@ registerOp(clearLayerHandler);
 registerOp(mergeDownLayerHandler);
 registerOp(moveNodeHandler);
 registerOp(addGroupHandler);
+registerOp(setGroupCollapsedHandler);
 registerOp(fillHandler);
 registerOp(lassoFillHandler);
 registerOp(setSelectionHandler);
@@ -99,6 +101,7 @@ export {
   createMergeDownLayerOp,
   createMoveNodeOp,
   createAddGroupOp,
+  createSetGroupCollapsedOp,
   type SetLayerVisibilityParams,
   type SetLayerOpacityParams,
   type SetLayerClippingParams,
@@ -110,6 +113,7 @@ export {
   type MergeDownLayerParams,
   type MoveNodeParams,
   type AddGroupParams,
+  type SetGroupCollapsedParams,
 } from './layerOps';
 export { fillHandler, createFillOp, fillRegion, type FillParams } from './fill';
 export { lassoFillHandler, createLassoFillOp, type LassoFillParams } from './lassoFill';

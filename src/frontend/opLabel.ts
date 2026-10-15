@@ -42,6 +42,8 @@ export function describeOp(op: Operation): string {
       return p.wrapLayerId ? `folder "${p.name}" (wrap)` : `folder "${p.name}"`;
     case 'moveNode':
       return p.parentId ? `→ into ${p.parentId}` : '→ top';
+    case 'setGroupCollapsed':
+      return p.collapsed ? 'collapse' : 'expand';
     case 'addVariant':
       return p.empty ? '空スロットを足す' : `${p.copy ? 'copy' : 'new'} variant "${p.name}"`;
     case 'setVariantIndex':

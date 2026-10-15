@@ -47,6 +47,7 @@ interface SerializedGroup {
   name: string;
   visible: boolean;
   opacity: number;
+  collapsed: boolean;
   children: SerializedNode[];
   /** 差分スタック（横軸）なら、いま出ている差分の位置。落とすと全差分が重なって出てしまう。 */
   variantIndex?: number;
@@ -76,6 +77,7 @@ function serializeNode(n: LayerNode): SerializedNode {
       name: n.name,
       visible: n.visible,
       opacity: n.opacity,
+      collapsed: n.collapsed,
       children: n.children.map(serializeNode),
       ...(n.variantIndex !== undefined ? { variantIndex: n.variantIndex } : {}),
       ...(n.blendMode && n.blendMode !== 'normal' ? { blendMode: n.blendMode } : {}),
@@ -105,6 +107,7 @@ function deserializeNode(s: SerializedNode): LayerNode {
       name: s.name,
       visible: s.visible,
       opacity: s.opacity,
+      collapsed: s.collapsed,
       children: s.children.map(deserializeNode),
       ...(s.variantIndex !== undefined ? { variantIndex: s.variantIndex } : {}),
       ...(s.blendMode ? { blendMode: s.blendMode } : {}),

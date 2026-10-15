@@ -19,7 +19,7 @@ export function isGroup(node: LayerNode): node is LayerGroup {
 }
 
 export function createGroup(id: string, name: string): LayerGroup {
-  return { id, name, visible: true, opacity: 1, children: [] };
+  return { id, name, visible: true, opacity: 1, collapsed: false, children: [] };
 }
 
 // ---- 差分スタック（レイヤーの横軸） ---------------------------------------
@@ -60,8 +60,8 @@ export function resolveSlot(node: LayerNode): LayerNode | null {
 
 /**
  * 差分スタックを作る（スロットの容れ物なので visible/opacity は固定）。
- * 既定では畳んで表示される＝「1 スロット 1 行」で、いま出ている差分だけが見える
- * （畳んでいるかどうかは UI 側のローカルな状態。types.ts の LayerGroup のコメント参照）。
+ * collapsed=true が既定: 畳んだ状態＝「1 スロット 1 行」で、いま出ている差分だけが見える。
+ * 開くと中の差分が縦に並び、1 枚ずつ掴んで外へ出せる（＝横軸の分解）。
  */
 export function createVariantStack(id: string, children: LayerNode[], index: number): LayerGroup {
   return {
@@ -69,6 +69,7 @@ export function createVariantStack(id: string, children: LayerNode[], index: num
     name: 'Variants',
     visible: true,
     opacity: 1,
+    collapsed: true,
     children,
     variantIndex: Math.max(0, Math.min(Math.max(0, children.length - 1), index)),
   };
@@ -83,7 +84,7 @@ export function createVariantStack(id: string, children: LayerNode[], index: num
  * 差分の中身に付いた表示/非表示は、どちらの意味でもないので持たせない。
  */
 export function createEmptySlot(id: string): LayerGroup {
-  return { id, name: '（空）', visible: true, opacity: 1, children: [], empty: true };
+  return { id, name: '（空）', visible: true, opacity: 1, collapsed: true, children: [], empty: true };
 }
 
 /** 空スロットか（＝「何も無い」を表す中身）。 */

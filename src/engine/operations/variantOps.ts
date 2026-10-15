@@ -261,31 +261,9 @@ export const moveAsVariantHandler: OpHandler = {
     const dest = getNode({ ...state, layers }, targetId);
     if (!dest) return state;
 
-    // (b') 落とし先が「スロットの中の 1 枚」＝カルーセルの特定のコマ → その隣へ差し込む。
-    // カルーセルは横軸そのものの絵なので、どのコマの隣に置くかを指して落とせる必要がある。
-    // ここで包んでしまうと横軸の中に横軸ができるため、必ず親スロットへ平らに混ぜる。
-    const destInfo = getParentInfo({ ...state, layers }, targetId);
-    const destParent = destInfo?.parentId ? getNode({ ...state, layers }, destInfo.parentId) : null;
-    if (destParent && isVariantStack(destParent)) {
-      const insert = side === 'right' ? destInfo!.index + 1 : destInfo!.index;
-      const children = [...destParent.children];
-      children.splice(insert, 0, ...incoming);
-      layers = replaceInTree(layers, destParent.id, () => ({
-        ...destParent,
-        children,
-        variantIndex: insert,
-      }));
-      // 落としたものをそのまま表示中の差分にするので、結果が即座に見える。
-      return {
-        ...state,
-        layers,
-        activeLayerId: activeLeafOf(children[insert]) ?? state.activeLayerId,
-      };
-    }
-
     let shown: LayerNode;
     if (isVariantStack(dest)) {
-      // (c) スロットそのものへ落とした → いま出ている差分の隣へ差し込む。
+      // (c) すでに横軸のスロット → いま出ている差分の隣へ差し込む。
       const at = variantIndexOf(dest);
       const insert = side === 'right' ? at + 1 : at;
       const children = [...dest.children];

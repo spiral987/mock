@@ -6,9 +6,6 @@
   --muted: #9aa0ac;
   --accent: #5b9dff;
   --border: #3c3f48;
-  /* サムネイル（行・カルーセルのコマ）の外枠。中身が透明でも「板がそこにある」と分かる濃さ。
-     四角い板は border、フォルダの形は影を重ねた輪郭で、同じ色を使って見た目を揃える。 */
-  --thumb-edge: rgba(255, 255, 255, 0.34);
 }
 
 * {
@@ -104,12 +101,10 @@ body {
   width: 270px;
 }
 
-/* 行が「掴む/開く | 名前 | 横軸（サムネイル＋左右の控え） | 印」の 4 つ組みで、
-   横軸のぶん名前に回せる幅が減るので、ツールパネルより広く取る。
-   横軸が長い行（差分が多い行）は窓を広げるほど帯も長くなる＝端まで見えるようになるので、
-   ここは「既定でひととおり足りる」幅にしてある（足りなければ枠を掴んでリサイズ）。 */
+/* 差分スロット行は「開閉 + サムネ + 名前 + ‹ n/m › + 各ボタン」と要素が多いので、
+   ツールパネルより少し広く取る（それでも足りなければ枠を掴んでリサイズできる）。 */
 .float-layers {
-  width: 380px;
+  width: 320px;
 }
 
 /* 操作パネル（追加 / 選択中の行への操作 / 不透明度）とレイヤーリストを分け、リストだけを
@@ -1282,21 +1277,6 @@ button.active {
   font-size: 13px;
   border: 1px solid transparent;
   background: var(--panel-2);
-  /* 行は「掴む・眺める」面なので、文字を選ばせない・文字カーソルを出さない。
-     .layer-head だけに置いていると、その兄弟であるカルーセルには継承されず、帯の上で
-     I ビームが出てドラッグでテキストが選べてしまう（掴んだつもりで選択されるので気持ち悪い）。
-     行そのものに置いて、子孫ぜんぶに効かせる。 */
-  cursor: default;
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-/* 名称変更の入力欄だけは文字を選べないと使えないので戻す。 */
-.layer-name-input,
-.state-name-input {
-  cursor: text;
-  user-select: text;
-  -webkit-user-select: text;
 }
 
 /* 描き先（＝いま筆が乗るリーフ）。フォルダは描き先になれないので、フォルダを選んでいる間も
@@ -1304,16 +1284,14 @@ button.active {
    淡い塗りと行の「描」印だけで示す。枠を両方に出すと、フォルダを選んだのに前のリーフが
    青枠のまま＝そっちが操作対象に見える、という取り違えが起きる。 */
 .layer-item.active {
-  /* background ではなく background-image で重ねる: 行を不透明のまま保たないと、
-     行の裏に回っている束の影（box-shadow のコピー）が透けて見えてしまう。 */
-  background-image: linear-gradient(rgba(91, 157, 255, 0.08), rgba(91, 157, 255, 0.08));
+  background: rgba(91, 157, 255, 0.08);
 }
 
 /* 上のレイヤー操作ボタンが効く行＝いま選んでいる行。リーフでもフォルダでも同じ見え方にする。
    ::before/::after は D&D のドロップ位置インジケータが使っているので、帯は内側影で描く。 */
 .layer-item.selected {
   border-color: var(--accent);
-  background-image: linear-gradient(rgba(91, 157, 255, 0.16), rgba(91, 157, 255, 0.16));
+  background: rgba(91, 157, 255, 0.16);
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
@@ -1353,47 +1331,15 @@ button.active {
   background: rgba(91, 157, 255, 0.16);
 }
 
-/* 行の組み: [⠿ ▾] [名前] [横軸（サムネイル）] [印]。
-   名前と印を同じ幅で伸ばす（flex: 1 1 0）ので、あいだのサムネイルはどの行でも同じ位置に立つ。
-   縦に並べたときサムネイルが 1 本の線に揃い、その線の左右に控えの差分が覗く＝
-   リストそのものが「縦軸（行）× 横軸（差分）」の図になる。 */
 .layer-head {
   display: flex;
   align-items: center;
-  /* 入れ子の段付け。--depth は JSX が数値で渡す。 */
-  padding-left: calc(4px + var(--depth, 0) * 12px);
   /* 要素数が多い行（差分スロット = 開閉 + サムネ + 各ボタン）でも名前の幅が残るよう詰める。 */
   gap: 6px;
   /* 行本体は「長押しで持ち上がる」ので即ドラッグの grab は出さない。掴む取っ手は ⠿ 側。 */
   cursor: default;
   user-select: none; /* ドラッグ中に行テキストを選択しない */
   touch-action: none; /* ペン/タッチでも行からジェスチャを開始できる（スクロールに奪われない） */
-}
-
-/* 掴む・開く（行そのものへの手）。幅は中身なり＝行の左端に固定で座る。 */
-.lh-left {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-
-/* 印（描 / 非 / 乗 / ⤵ / n/m）。名前と同じ基準幅 0 で等しく伸びるので、
-   中身が何であれ名前の欄と同じ幅になる ＝ あいだの横軸の位置が動かない。
-   印は右端に寄せる（行の右肩に status が並ぶ形）。 */
-.lh-right {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex: 1 1 0;
-  min-width: 0;
-}
-
-/* 名前の書き換え中だけは横軸の位置合わせをやめ、印の側の余りを入力欄に回す
-   （名前の欄そのままだと、長い名前を打つのに狭い）。 */
-.layer-head.is-editing > .lh-right {
-  flex: 0 1 auto;
 }
 
 /* 差分を持つ行は左右にスライドできる、とカーソルで示す。 */
@@ -1414,10 +1360,7 @@ button.active {
   cursor: grab;
   color: var(--muted);
   letter-spacing: -2px;
-  /* 幅は決め打ち。行の左端の固定幅（⠿ + ▾）から横軸の位置が決まるので、
-     ⠿ の字形（フォント任せ）で位置が動かないようにする。 */
-  width: 16px;
-  text-align: center;
+  padding: 0 3px;
   user-select: none;
   flex: none;
   touch-action: none; /* ペン/タッチで pointermove を奪われない（スクロール化を防ぐ） */
@@ -1467,7 +1410,7 @@ button.active {
 }
 
 .layer-item.drop-into {
-  background-image: linear-gradient(rgba(91, 157, 255, 0.18), rgba(91, 157, 255, 0.18));
+  background: rgba(91, 157, 255, 0.18);
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
@@ -1496,7 +1439,7 @@ button.active {
 
 .layer-item.drop-left,
 .layer-item.drop-right {
-  background-image: linear-gradient(rgba(126, 199, 168, 0.16), rgba(126, 199, 168, 0.16));
+  background: rgba(126, 199, 168, 0.16);
   outline: 1px solid rgba(126, 199, 168, 0.8);
   outline-offset: -1px;
 }
@@ -1513,17 +1456,8 @@ button.active {
   white-space: nowrap;
 }
 
-/* 帯が開いている間は名前を沈めて帯に譲る。帯は名前の欄の右側に重なるので、そのままだと
-   文字が帯の縁でぶつ切りに見える（名前は帯のラベルにも出るので読めなくなりはしない）。 */
-.layer-item.is-axis-open > .layer-head > .layer-name {
-  opacity: 0.3;
-}
-
-/* 名前の欄。印（.lh-right）と同じ基準幅 0 で伸びる ＝ 2 つが必ず同じ幅になり、
-   あいだの横軸が動かない。長い名前はここで省略される（横軸を押しのけない）。 */
 .layer-name {
-  flex: 1 1 0;
-  min-width: 0;
+  flex: 1;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1534,90 +1468,15 @@ button.active {
   font-weight: 600;
 }
 
-/* 行の中央に立てる横軸。中身はサムネイル 1 枚だけで、控えの差分（.axis-peek）は
-   絶対配置で外へはみ出す＝幅を食わない。左右の margin はそのはみ出しぶんの場所取りで、
-   差分の無い行にも同じだけ空けてある（行の種類でサムネイルの位置がずれないように）。 */
-.layer-axis {
-  position: relative;
-  flex: none;
-  display: flex;
-  align-items: center;
-  margin: 0 14px;
-}
-
-/* 控えの差分。サムネイルの後ろへ潜り込ませ、端だけを覗かせる（＝紙の束の見え方）。
-   薄くして小さくするのは「これは今出ていない・奥にある」を色と大きさで言うため。 */
-.axis-peek {
-  position: absolute;
-  top: 50%;
-  width: 22px;
-  height: 28px;
-  transform: translateY(-50%);
-  /* 縁は横軸の緑。中身が空（描いていない差分）でも「横に何かある」が色で分かるようにする。
-     カルーセルの中央枠・落とし先の縁と同じ色なので、開いた先とも対応が取れる。 */
-  border: 1px solid rgba(126, 199, 168, 0.55);
-  border-radius: 3px;
-  background-color: #2a2b31;
-  overflow: hidden;
-  opacity: 0.6;
-  z-index: 0;
-  pointer-events: none; /* 見せるだけ。選ぶ・並べ替えるはカルーセルのコマが持つ */
-}
-
-/* 10px ぶんサムネイルの下へ潜り込ませる（覗くのは残りの 12px）。 */
-.axis-peek.is-prev {
-  right: 100%;
-  margin-right: -10px;
-}
-
-.axis-peek.is-next {
-  left: 100%;
-  margin-left: -10px;
-}
-
-.axis-peek img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  -webkit-user-drag: none;
-  object-fit: cover;
-}
-
-/* 覗きは幅 22 のうち 10 がサムネイルの下に隠れるので、見えているのは外側の 12px だけ。
-   そこに絵の**真ん中あたり**が来るよう寄せる（端を見せると、絵が中央にある普通のレイヤーでは
-   ほとんど何も写らない＝「何か横にある」しか言えない板になってしまう）。 */
-.axis-peek.is-prev img {
-  object-position: 80% center;
-}
-
-.axis-peek.is-next img {
-  object-position: 20% center;
-}
-
-/* 空スロット（「何も無い」）の控え。行の中の空スロットと同じ、破線＋斜線で「無い」を描く。 */
-.axis-peek.is-empty {
-  border-style: dashed;
-  background-image: linear-gradient(
-    to top right,
-    transparent calc(50% - 0.5px),
-    rgba(255, 255, 255, 0.3) calc(50% - 0.5px),
-    rgba(255, 255, 255, 0.3) calc(50% + 0.5px),
-    transparent calc(50% + 0.5px)
-  );
-}
-
 /* レイヤー行のサムネイル（描画内容のプレビュー）。透明部分は市松模様で示す。
    TS 側の LAYER_THUMB_W/H と一致させること（生成解像度がこの2倍で焼かれる）。 */
 .layer-thumb {
   flex: none;
-  /* 控えより手前。束の一番上の 1 枚＝いま絵に出ているもの。 */
-  position: relative;
-  z-index: 1;
   width: 48px;
   height: 36px;
   object-fit: contain;
   border-radius: 3px;
-  border: 1px solid var(--thumb-edge);
+  border: 1px solid var(--border);
   background-color: #2a2b31;
   background-image:
     linear-gradient(45deg, #3a3b42 25%, transparent 25%),
@@ -1627,31 +1486,6 @@ button.active {
   background-size: 8px 8px;
   background-position: 0 0, 0 4px, 4px -4px, -4px 0;
   user-select: none;
-}
-
-/* フォルダのサムネイル: 角丸の板ではなく【タブ付きの形】そのものにする。
-   ツールの「＋フォルダ」アイコンと同じ形（左にタブ、本体の上辺はその右下）にしてあるので、
-   パネルの中で「フォルダ」の言い方が 1 つに揃う。カルーセルの中でも、どのコマがフォルダかが
-   中身を読まずに分かる。
-   名前に付けていた 📁 は廃止した ＝ 同じことを字と形で 2 回言わない（名前の幅もそのぶん空く）。 */
-.layer-thumb.is-folder,
-.vc-chip.is-folder {
-  clip-path: polygon(0 0, 26% 0, 38% 18%, 100% 18%, 100% 100%, 0 100%);
-  border-radius: 0;
-  /* 外枠は border ではなく影で描く: border は箱の形にしか引けず、タブの斜めに沿えない。
-     drop-shadow は【切り抜いた形】を辿るので、4 方向へ 1px ずつずらして重ねると
-     形どおりの輪郭になる。四角い板の border と同じ色・同じ太さに揃えてある。 */
-  border-color: transparent;
-  filter:
-    drop-shadow(1px 0 0 var(--thumb-edge)) drop-shadow(-1px 0 0 var(--thumb-edge))
-    drop-shadow(0 1px 0 var(--thumb-edge)) drop-shadow(0 -1px 0 var(--thumb-edge));
-}
-
-/* ホバーの反応も同じやり方で（枠の色替えの代わり）。 */
-.vc-chip.is-folder:hover {
-  filter:
-    drop-shadow(1px 0 0 #7ec7a8) drop-shadow(-1px 0 0 #7ec7a8) drop-shadow(0 1px 0 #7ec7a8)
-    drop-shadow(0 -1px 0 #7ec7a8);
 }
 
 /* 空スロットのサムネイル枠。透明市松（＝画素が無いだけ）と見分けが付くよう、市松を消して
@@ -1680,10 +1514,8 @@ button.active {
   font-style: italic;
 }
 
-/* 名称変更の入力欄。名前の欄と同じ場所に入るので、同じ伸び方にする。 */
 .layer-name-input {
-  flex: 1 1 0;
-  min-width: 0;
+  flex: 1;
   background: var(--bg);
   border: 1px solid var(--accent);
   border-radius: 4px;
@@ -1713,22 +1545,10 @@ button.active {
   border-left: 1px dashed var(--border);
 }
 
-/* 開閉の ▾ と、それが無い行の空け。同じ幅にしておくと、フォルダ行とリーフ行で
-   左の組の幅が揃う（＝行の左端の見え方が種類で変わらない）。 */
-.lh-left > .icon-btn,
-.layer-indent {
-  width: 24px;
-  flex: none;
-}
-
-/* 幅を決め打ちするので、字形は左右の padding ではなく箱の中央に置く。 */
-.lh-left > .icon-btn {
-  padding-left: 0;
-  padding-right: 0;
-}
-
 .layer-indent {
   display: inline-block;
+  width: 20px;
+  flex: none;
 }
 
 .layer-move {
@@ -1778,25 +1598,65 @@ button.active {
 }
 
 /* ---- レイヤーの横軸（差分スタック） ---------------------------------------
-   1 スロットに互いに排他な差分が左右に並ぶ行。「横に並んでいる」は
-   **サムネイルの左右から覗く控え**（.axis-peek）で言う。
-
-   ここまでの経緯（同じ案を何度も試さないための記録）:
-     - 緑の枠 + 左右のグラデ … 色は左右対称にしか出せず、1/3 でも左に何かあるように見えた
-     - 影で紙の束を覗かせる  … 主張が弱く、厚くしても意味が増えなかった
-     - 二重枠（太い辺＝そちらに続きがある）… 場所を食わず正確だが、「線が 1 本増えただけ」で
-       横軸だと読めない。太さの違いも隣の行と並べないと分からず、結局 1/2 の字を読んでいた
-     - 隣のサムネイルを行の端に入れる … 強いが行幅を 44px 食い、帯を外へ出すとずれすぎた
-   いまは【サムネイルを行の中央に置き、その左右に控えを覗かせる】。中央に置いたので左右対称に
-   出せて（どちら側に続くかがそのまま出る）、覗きは絶対配置でサムネイルの後ろへ潜り込むので
-   行幅は 28px しか食わない。カルーセルもこのサムネイルを中心に開くので、
-   「覗いていたものが広がって全部見える」という 1 つの動きに繋がる。
-   行が持つのはこの覗きと 1/2（正確な数）の 2 つだけ。 */
+   1 スロットに互いに排他な差分が左右に並ぶ行。左右にドラッグ（または ‹ ›）で
+   並列の差分が出てくる。「まだ横に何かある」ことを行の左右の縁で示す。 */
 .layer-item.has-variants {
-  /* 触る前に「左右に動く」ことが手に伝わる。グリップ・名前・ボタンは各自の cursor が勝つ。 */
-  cursor: ew-resize;
+  border-color: rgba(126, 199, 168, 0.55);
+  background:
+    linear-gradient(90deg, rgba(126, 199, 168, 0.16), transparent 14px),
+    linear-gradient(270deg, rgba(126, 199, 168, 0.16), transparent 14px), var(--panel-2);
 }
 
+/* 差分を覗き見中（サムネイルにホバー中）は、どのスロットを見ているかを縁で示す。 */
+.layer-item.has-variants.peeking {
+  border-color: rgba(126, 199, 168, 0.95);
+}
+
+/* サムネイルと、その背後に重なる横軸の札をひとまとまりにする箱。 */
+.thumb-axis {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+/* 横軸の残りを示す札。サムネイルと同じ形の四角を後ろに重ね、左右の端だけを覗かせる
+   （＝「同じ種類のものがこの向きにまだ重なっている」）。行の縁の緑グラデーションが
+   「この行に横軸がある」ことを示すのに対し、こちらは「どちら側に残っているか」を示す。
+   負のマージンでサムネイルの下に潜り込ませるので、行の高さも名前の幅もこれで変わらない。 */
+.axis-stub {
+  flex: none;
+  width: 22px;
+  height: 30px;
+  border: 1px solid rgba(126, 199, 168, 0.8);
+  border-radius: 3px;
+  background: rgba(126, 199, 168, 0.22);
+}
+
+.axis-stub.left {
+  margin-right: -13px;
+}
+
+.axis-stub.right {
+  margin-left: -13px;
+}
+
+/* サムネイルを札より前に出す（位置指定のある要素が後に描かれる規則を使う）。 */
+.thumb-axis .layer-thumb {
+  position: relative;
+  z-index: 1;
+}
+
+/* 空スロットの枠は中が透けるので、後ろの札が覗いてしまう。行の地の色で塞ぐ
+   （.layer-item.has-variants の背景はサムネイル位置では var(--panel-2) と同色）。 */
+.layer-item.has-variants .layer-thumb.is-empty {
+  background-color: var(--panel-2);
+}
+
+/* 端（その向きにはもう差分が無い）。消すが詰めない: 位置が動くとサムネイルが揺れて、
+   行に重ねて出るカルーセルの中央枠ともずれる。 */
+.axis-stub.is-end {
+  visibility: hidden;
+}
 
 /* 行に出す「n/m」。枚数と現在位置だけを示す（選ぶのは左右スライドのカルーセル）。 */
 .variant-count {
@@ -1807,169 +1667,39 @@ button.active {
   user-select: none;
 }
 
-/* 行に乗せると出るカルーセル。横軸そのものの絵で、縦一覧を廃止したぶんの役目を全部持つ:
-   見る（並びと中身）／切り替える（クリック・左右スライド）／並べ替える（コマを掴む）／
-   取り出す（コマを外へ出す）／足す（コマの隣へ落とす）。
-   行の高さと位置をそのまま使うので、出入りでレイアウトは一切動かない。
-   （パネルの外へ出す案も試したが、行から離れすぎて「どの行の話か」が読めなくなった。） */
+/* ‹ n/m › のスライダー。行の他のボタンより一段静かに、でも数が読めるように。 */
+/* 左右スライド中だけ行の上に重なるカルーセル。行の高さと位置をそのまま使い、
+   レイアウトを一切動かさずに「その場で」サムネイルが並ぶ。 */
 .variant-carousel {
   position: absolute;
-  top: 0;
-  /* 両端のぼかし（.vc-fade）の幅。コマがここで地の色に溶ける。 */
-  --vc-fade-w: 34px;
-  /* サムネイル（.layer-axis）の真上に、そこを中心にして開く。いま出ている 1 枚は開いても
-     閉じても同じ場所に居るので、覗きが広がっただけに見える。
-     margin-left は「行の中心」から「サムネイルの中心」までのずれを足すぶん:
-       2px  … ヘッダの padding-left(4px) の半分（行の中心とヘッダ内容の中心のずれ）
-       26px … 左に固定で座る組（⠿16 + gap6 + ▾24 + gap6 = 52）の半分。
-              名前と印が同じ幅で伸びるので、横軸の中心は「ヘッダ内容の中心 + 52/2」に立つ。
-       段付けぶん（--depth × 12px）の半分
-     どれも固定値なので、パネルを広げても縮めてもサムネイルの真上に来る。 */
-  left: 50%;
-  transform: translateX(-50%);
-  margin-left: calc(28px + var(--depth, 0) * 6px);
-  /* 左右に 64px ずつ残す ＝ ⠿ と ▾（左端から 56px ぶん）には絶対に届かない
-     ＝ 差分にしたフォルダはいつでも開ける。残りは全部使うので、パネルを広げるほど
-     横軸が長く見える（何枚あるか・端がどこかを見たいときは窓を広げればよい）。 */
-  width: calc(100% - 128px);
-  /* 覆うのは「その行の段」だけ。差分にしたフォルダを開けるようにした以上、開いた中身
-     （li の中に入る入れ子リスト）まで帯が被さってはいけない。
-     高さ = .layer-item の縦 padding 7×2 + サムネイルの高さ 36（＝行の高さ、TS の LAYER_THUMB_H）。 */
-  height: 50px;
+  inset: 0;
   z-index: 3;
   overflow: hidden;
   border-radius: 6px;
-  background: rgba(20, 21, 26, 0.94);
-  display: flex;
-  align-items: center;
-  animation: vc-in 0.1s ease-out;
-  /* 帯の中は「コマ＝掴む手（grab）／それ以外の地＝引く手（ew-resize）」。
-     押せる場所の境目をカーソルの形がそのまま教えるので、覚えることが無い。 */
-  cursor: ew-resize;
+  /* 不透明にして、下の行（名前・n/m・各ボタン）が透けて二重に見えないようにする。 */
+  background: #181a1e;
+  box-shadow: inset 0 0 0 1px rgba(126, 199, 168, 0.5);
+  pointer-events: none; /* 掴んでいるのは下の行。ここは表示だけ */
+  touch-action: none;
 }
 
-/* 中身（フォルダ）を開いている行では、入れ子リストの手前で止める（下の行に被らない）。
-   = 上の padding 7 + 行 36 + 入れ子リストの margin-top 4。 */
-.layer-item.is-open > .variant-carousel {
-  height: 47px;
-}
-
-/* 差分を受け入れている間だけ、行いっぱいに広がる。
-   ⠿ / ▾ を覆わない約束は「帯が出ている間もその行を触れること」のためのもので、
-   落とし先を選んでいる最中は指がもう塞がっている＝守る意味が無い。そのぶんの幅を
-   落とし場所の表示に回す（横軸が長い行でも端のコマまで見えて、そこへ落とせる）。 */
-.variant-carousel.is-dropping {
-  left: 0;
-  right: 0;
-  width: auto;
-  margin-left: 0;
-  transform: none;
-  /* 落とし先を選んでいる間はぼかしも出さない（端のコマまではっきり見せたい）。 */
-  --vc-fade-w: 0px;
-  cursor: default; /* 受け入れ中は引けない（指はもう塞がっている） */
-}
-
-@keyframes vc-in {
-  from {
-    opacity: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .variant-carousel {
-    animation: none;
-  }
-}
-
-/* コマが流れる窓。帯いっぱいで、はみ出したコマはここで切られる。 */
-.vc-window {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-}
-
-/* 帯の両端のぼかし。コマがここへ滑り込んで地の色に溶ける＝「まだ続きがある」の絵で、
-   コマが少ないときはそのまま余白（掴んでよさそうな空き地）に見える。
-   掴む役は持たない（素通し）: 引っ張れる場所は「帯のうちコマ以外の全部」で、帯そのものが受ける。
-   帯の幅は削らない（削ると見えるコマの枚数が減ってしまう）。 */
-.vc-fade {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: var(--vc-fade-w);
-  z-index: 1; /* 流れてくるコマより手前 */
-  pointer-events: none;
-}
-
-.vc-fade.is-left {
-  left: 0;
-  background: linear-gradient(
-    to right,
-    rgba(20, 21, 26, 0.98) 40%,
-    rgba(20, 21, 26, 0.75) 70%,
-    rgba(20, 21, 26, 0)
-  );
-}
-
-.vc-fade.is-right {
-  right: 0;
-  background: linear-gradient(
-    to left,
-    rgba(20, 21, 26, 0.98) 40%,
-    rgba(20, 21, 26, 0.75) 70%,
-    rgba(20, 21, 26, 0)
-  );
-}
-
-/* 帯の原点を行の中央に置き、そこから transform で流す（中央の枠は動かない）。 */
+/* サムネイルの帯。中央の枠に来た 1 枚が選択対象。left:50% と半分ぶんの戻しで、
+   transform:translateX(0) のとき先頭の 1 枚がちょうど中央に来る。 */
 .vc-track {
-  display: flex;
-  gap: 6px; /* .vc-chip の幅 48 と合わせて VARIANT_PITCH_PX = 54 */
-  margin: -18px 0 0 -24px;
   position: absolute;
   top: 50%;
   left: 50%;
-  will-change: transform;
+  display: flex;
+  gap: 6px; /* .vc-chip の幅 48 と合わせて VARIANT_PITCH_PX = 54 */
+  margin: -18px 0 0 -24px;
 }
 
-/* 差分を受け入れている間は、1 枚を中央に置く transform（VARIANT_PITCH_PX 前提）をやめて、
-   全部を並べて見せる（どこへ入れるかを選ぶ場面なので、並び全体が見えている必要がある）。
-   コマ 1 枚だけの帯（＝初めての差分化）が左端に貼り付かないよう中央寄せにする。 */
-.vc-track.dropping {
-  position: static;
-  margin: 0;
-  padding: 0 2px;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-}
-
-/* 受け入れ中は【必ず全部が帯に収まる】ようにする。コマは縮められる（flex-shrink）ので、
-   差分が何枚あっても端のコマまで見えて狙える ＝ 端に足せなくなることが無い。
-   基準は普段と同じ 48px なので、収まるうち（既定幅で 6 枚ほど）は大きさも変わらない
-   ＝ 運んでいったときに帯の絵が作り変わらない。
-
-   （以前はここでコマを 34px に詰め、さらに N+1 個の「隙間」を挟んでいた。落とせる場所を
-   そのまま見せる形ではあったが、緑の箱が並ぶぶん帯の絵が別物になり、何がどこにあるか
-   読めなくなるので廃止した。落とし先は指しているコマの縁 1 本で示す。） */
-.vc-track.dropping .vc-chip {
-  flex: 0 1 48px;
-  width: auto;
-  /* 極端に多い行では線になるまで潰れる。帯 1 本にサムネイルが 20 枚は元々入らない
-     （入れても見分けは付かない）ので、そこで守るべきは「どの位置にも落とせる」方だけ。 */
-  min-width: 4px;
-}
-
-/* 横軸の 1 枚。掴んで動かせる（同じ帯の中で並べ替え／外へ出して取り出し）。 */
 .vc-chip {
-  position: relative;
   flex: none;
   width: 48px;
   height: 36px;
   border-radius: 3px;
-  cursor: grab;
-  touch-action: none; /* ペン/タッチでもここからジェスチャを始められる */
-  border: 1px solid var(--thumb-edge);
+  border: 1px solid var(--border);
   background-color: #2a2b31;
   /* 透明部分は市松模様（レイヤーサムネイルと同じ扱い）。 */
   background-image:
@@ -1985,67 +1715,13 @@ button.active {
 
 .vc-chip img {
   display: block;
-  -webkit-user-drag: none;
   width: 100%;
   height: 100%;
   object-fit: contain;
 }
 
-/* 空スロット（「何も無い」）の差分。行の中の空スロットと同じ、破線＋斜線で「無い」を描く。 */
-.vc-empty {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background-image: linear-gradient(
-    to top right,
-    transparent calc(50% - 0.5px),
-    rgba(255, 255, 255, 0.3) calc(50% - 0.5px),
-    rgba(255, 255, 255, 0.3) calc(50% + 0.5px),
-    transparent calc(50% + 0.5px)
-  );
-}
-
 .vc-chip.on {
   opacity: 1;
-}
-
-.vc-chip:hover {
-  opacity: 1;
-  border-color: #7ec7a8;
-}
-
-/* 持ち上げているコマ。実体はその場に残り、ゴーストが指に付いてくる。 */
-.vc-chip.lifted {
-  opacity: 0.3;
-  border-style: dashed;
-  border-color: var(--accent);
-}
-
-.vc-chip.is-empty {
-  border-style: dashed;
-}
-
-/* ここへ落ちる、を指しているコマの【入る側の縁】1 本で示す。
-   コマとコマの間に箱を挟むと、そのぶん並びが作り変わって「何がどこにあるか」が読めなくなる。
-   縁なら並びは 1px も動かず、増える絵も線 1 本だけで済む。
-   縦の並べ替え（青い横線）と区別できるよう、横軸と同じ緑で、向きは縦。
-   内側に引くので、フォルダのコマ（切り抜いた形）でも形どおりに収まる。 */
-.vc-chip.drop-left,
-.vc-chip.drop-right {
-  opacity: 1; /* 指している 1 枚は沈めない */
-}
-
-.vc-chip.drop-left {
-  box-shadow: inset 3px 0 0 #7ec7a8;
-}
-
-.vc-chip.drop-right {
-  box-shadow: inset -3px 0 0 #7ec7a8;
-}
-
-/* 受け入れ中はコマ自身が落とし先ではないので、掴む手も出さない。 */
-.vc-track.dropping .vc-chip {
-  cursor: default;
 }
 
 /* 中央の固定枠。ここに来ている 1 枚がキャンバスにも出ていて、離すとそれで確定する。 */
@@ -2055,24 +1731,27 @@ button.active {
   left: 50%;
   width: 52px;
   height: 40px;
-  transform: translate(-50%, -50%);
-  border: 2px solid #7ec7a8;
-  border-radius: 5px;
-  box-shadow: 0 0 0 2px rgba(126, 199, 168, 0.22);
-  pointer-events: none;
+  margin: -20px 0 0 -26px;
+  border: 1.5px solid #7ec7a8;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
 }
 
+/* いま枠に入っている差分の名前と位置。枠と重ならないよう行の右端へ。 */
 .vc-label {
   position: absolute;
   right: 6px;
-  bottom: 3px;
-  z-index: 2; /* 端のぼかし(.vc-fade)より手前。ラベルが薄暗くならないように */
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 10px;
   color: #a8dcc4;
   background: rgba(24, 26, 30, 0.9);
   padding: 2px 4px;
   border-radius: 3px;
-  pointer-events: none;
 }
 
 /* ---- レイヤー操作ボタン（Layers パネル上部） ------------------------------
@@ -2307,13 +1986,6 @@ button.active {
    実測して 1 枚に描くことで、入れ子と無関係に真っ直ぐ引ける。 */
 .layer-tree {
   position: relative;
-}
-
-/* 横軸の外枠（.slot-frame）は行の外へ 4px 出る。.layer-scroll は overflow-y:auto なので
-   overflow-x も auto に計算され、行の外へ出たぶんは切られてしまう。最上位の行にだけ空けておけば、
-   入れ子の行は親の .layer-item の padding(8px) で自動的に足りる。 */
-.layer-tree > .layer-list {
-  padding: 0 6px;
 }
 
 .rail-svg {

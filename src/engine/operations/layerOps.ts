@@ -424,9 +424,34 @@ export function createAddGroupOp(groupId: string, name: string, wrapLayerId?: st
 }
 
 // ---- フォルダの折りたたみ（UI 状態だが replay 整合のため操作化） ------------
-// フォルダの開閉に op は無い。見た目しか変わらないものを log に積むと、開閉のたびに
-// undo が 1 回ぶん食われる（絵は何も変わっていないのに Undo が効かなくなったように見える）。
-// 開閉は CanvasEditor がローカルに覚える。
+export interface SetGroupCollapsedParams {
+  groupId: string;
+  collapsed: boolean;
+}
+
+export const setGroupCollapsedHandler: OpHandler = {
+  type: 'setGroupCollapsed',
+  klass: 'edit',
+  apply(state, op) {
+    const { groupId, collapsed } = op.params as unknown as SetGroupCollapsedParams;
+    const node = getNode(state, groupId);
+    if (!node || !isGroup(node)) return state;
+    return updateNode(state, groupId, (n) => ({ ...n, collapsed }));
+  },
+  consolidate: sameTarget,
+};
+
+export function createSetGroupCollapsedOp(groupId: string, collapsed: boolean): Operation {
+  return {
+    id: genId('setGroupCollapsed'),
+    type: 'setGroupCollapsed',
+    klass: 'edit',
+    params: { groupId, collapsed },
+    region: EMPTY,
+    layerId: groupId,
+    timestamp: Date.now(),
+  };
+}
 
 // ---- 全消去（リーフ内容を透明に） -----------------------------------------
 export interface ClearLayerParams {
