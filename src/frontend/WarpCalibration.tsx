@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { KIND_LABEL, type OptResult, type PathKind, type Pt, type Tendency, type WarpField } from './warpField';
+import { genPath, resample } from './warpPaths';
 
 /**
  * 場のゆがみ補正のキャリブレーション（描画とは分離した学習タスク）。
@@ -9,9 +10,13 @@ import { KIND_LABEL, type OptResult, type PathKind, type Pt, type Tendency, type
  * 経路がユーザの「理想の線」になるので、なぞった軌跡とのズレを WarpField に学習させる。
  * 1 セット終わるごとに、ズレ方の傾向を集計し、補正のかけ方（カーネル幅・強さ）を最適化する。
  * キャンバスには一切描かない。ガイドはキャンバスが見えている範囲に出す。
+ * 場はキャンバス座標で持つので、画面座標 ⇄ キャンバス座標を map で変換して渡す。
+ * 経路は短いと局所的に極端な歪みを学習しやすいので、見えている範囲に対して長めに取る。
  */
 
+/** area: キャンバスが画面に見えている範囲（client px）。map: canvas = (client - left/top) · scale */
 export type CalibArea = { left: number; top: number; width: number; height: number };
+export type CalibMap = { left: number; top: number; scale: number };
 type Trial = { kind: PathKind; rawErr: number; shownErr: number };
 type Guide = { kind: PathKind; path: Pt[] };
 
@@ -19,72 +24,6 @@ const BLOCK = 21; // 1 セットの試行数（3 種類 × 7）
 const MARGIN = 40;
 const KINDS: PathKind[] = ['line', 'arc', 's'];
 const DIR_ARROW = ['→', '↘', '↓', '↙', '←', '↖', '↑', '↗'];
-
-/* ---------------------------------------------------------------- 経路の生成 */
-
-/** 折れ線を等間隔（step px）に打ち直す。 */
-function resample(pts: Pt[], step = 2): Pt[] {
-  const out: Pt[] = [pts[0]];
-  let carry = 0;
-  for (let i = 1; i < pts.length; i++) {
-    const a = pts[i - 1];
-    const b = pts[i];
-    const L = Math.hypot(b.x - a.x, b.y - a.y);
-    let d = step - carry;
-    while (d <= L) {
-      out.push({ x: a.x + ((b.x - a.x) * d) / L, y: a.y + ((b.y - a.y) * d) / L });
-      d += step;
-    }
-    carry = L - (d - step);
-  }
-  const last = pts[pts.length - 1];
-  out.push({ x: last.x, y: last.y });
-  return out;
-}
-
-function genPath(kind: PathKind, L: number, T: number, w: number, h: number): Pt[] {
-  const rnd = (a: number, b: number) => a + Math.random() * (b - a);
-  const maxLen = Math.max(120, Math.min(450, Math.min(w, h) * 0.9));
-  const cx = rnd(L, L + w);
-  const cy = rnd(T, T + h);
-  const pts: Pt[] = [];
-  if (kind === 'line') {
-    const len = rnd(120, maxLen);
-    const ang = rnd(0, Math.PI * 2);
-    pts.push({ x: cx - (Math.cos(ang) * len) / 2, y: cy - (Math.sin(ang) * len) / 2 });
-    pts.push({ x: cx + (Math.cos(ang) * len) / 2, y: cy + (Math.sin(ang) * len) / 2 });
-  } else if (kind === 'arc') {
-    const r = rnd(70, maxLen / 2);
-    const sweep = rnd(Math.PI / 3, Math.PI) * (Math.random() < 0.5 ? 1 : -1);
-    const a0 = rnd(0, Math.PI * 2);
-    for (let i = 0; i <= 64; i++) {
-      const a = a0 + (sweep * i) / 64;
-      pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
-    }
-  } else {
-    // S字: 始点→終点の 3 次ベジエ。制御点を経路の左右へ逆向きに振る。
-    const len = rnd(160, maxLen);
-    const ang = rnd(0, Math.PI * 2);
-    const ux = Math.cos(ang);
-    const uy = Math.sin(ang);
-    const nx = -uy;
-    const ny = ux;
-    const hgt = rnd(0.25, 0.45) * len * (Math.random() < 0.5 ? 1 : -1);
-    const A = { x: cx - (ux * len) / 2, y: cy - (uy * len) / 2 };
-    const B = { x: cx + (ux * len) / 2, y: cy + (uy * len) / 2 };
-    const P1 = { x: A.x + (ux * len) / 3 + nx * hgt, y: A.y + (uy * len) / 3 + ny * hgt };
-    const P2 = { x: A.x + (2 * ux * len) / 3 - nx * hgt, y: A.y + (2 * uy * len) / 3 - ny * hgt };
-    for (let i = 0; i <= 64; i++) {
-      const t = i / 64;
-      const m = 1 - t;
-      pts.push({
-        x: m * m * m * A.x + 3 * m * m * t * P1.x + 3 * m * t * t * P2.x + t * t * t * B.x,
-        y: m * m * m * A.y + 3 * m * m * t * P1.y + 3 * m * t * t * P2.y + t * t * t * B.y,
-      });
-    }
-  }
-  return resample(pts);
-}
 
 /* ---------------------------------------------------------------- 表示用 */
 
@@ -102,10 +41,12 @@ function outwardText(v: number | null) {
 export function WarpCalibration({
   warp,
   area,
+  map,
   onClose,
 }: {
   warp: WarpField;
   area: CalibArea;
+  map: CalibMap;
   onClose: (trials: number) => void;
 }) {
   const cvRef = useRef<HTMLCanvasElement>(null);
@@ -253,10 +194,13 @@ export function WarpCalibration({
     return () => window.removeEventListener('keydown', h, true);
   }, []);
 
+  const toDoc = (p: Pt): Pt => ({ x: (p.x - map.left) * map.scale, y: (p.y - map.top) * map.scale });
+
   const addPoint = (x: number, y: number, pressure: number) => {
-    const [dx, dy] = warp.feed(x, y);
-    const sx = x + dx;
-    const sy = y + dy;
+    const q = toDoc({ x, y });
+    const [dx, dy] = warp.feed(q.x, q.y); // 変位はキャンバス px → 画面 px に戻して表示
+    const sx = x + dx / map.scale;
+    const sy = y + dy / map.scale;
     const s = strokeRef.current;
     const c = ctx();
     if (s && c) {
@@ -300,7 +244,7 @@ export function WarpCalibration({
     if (!strokeRef.current) return;
     strokeRef.current = null;
     const g = guideRef.current!;
-    const r = warp.endTrace(g.path, g.kind);
+    const r = warp.endTrace(g.path.map(toDoc), g.kind);
     busyRef.current = true;
     if (!r.ok) {
       setMsg('短すぎるため学習しませんでした（始点から終点までなぞってください）');
@@ -353,8 +297,7 @@ export function WarpCalibration({
           補正なし {f1(opt.before)}px → 既定の補正 {f1(opt.defaultErr)}px → 最適化後 <b>{f1(opt.after)}px</b>
         </div>
         <div className="muted">
-          場所の範囲 {p.sigS}px ／ 方向で{p.sigA > 0 ? `区別する（幅 ${p.sigA}）` : '区別しない'} ／ 曲がり具合で
-          {p.sigK > 0 ? `区別する（幅 ${p.sigK}）` : '区別しない'} ／ 強さ {p.strength}
+          なめらかさ λ={p.smooth}（大きいほどキャンバス全体がゆるやかに歪む）／ 強さ {p.strength}
         </div>
       </>
     );

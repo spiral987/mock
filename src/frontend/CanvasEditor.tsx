@@ -112,7 +112,8 @@ import { reorderIndex } from './layerDnd';
 import { ColorPicker } from './ColorPicker';
 import { FloatWindow, Section } from './Float';
 import { WarpField } from './warpField';
-import { WarpCalibration, type CalibArea } from './WarpCalibration';
+import { WarpCalibration, type CalibArea, type CalibMap } from './WarpCalibration';
+import { WarpTest } from './WarpTest';
 import { ToolIcon, type ToolIconName } from './ToolIcon';
 import { drawMarchingAnts, antsDash, ANTS_STEPS } from './marchingAnts';
 
@@ -211,6 +212,12 @@ type DropPos = 'above' | 'below' | 'into' | 'left' | 'right';
 // S 押下中にキャンバスを上下ドラッグして太さ調整するときの感度（ドラッグpx → 太さ変化量）。
 // MergeView と同じ操作感に揃える。
 const SIZE_DRAG_FACTOR = 0.5;
+
+// 場のゆがみ補正の強さ（学習した変位に掛ける倍率）。従来は 0〜1.5 のスライダーだけだったが、
+// 補正の挙動を観察できるよう大きな値も試せるようにする（最終仕様ではなく観察用）。
+const WARP_STRENGTH_SLIDER_MAX = 10;
+const WARP_STRENGTH_INPUT_MAX = 50; // 数値入力ではここまで
+const WARP_STRENGTH_PRESETS = [0, 1, 1.5, 3, 5, 10];
 
 // レイヤー行サムネイルの表示サイズ(px)。生成は高DPIで滲まないよう2倍解像度で焼く。
 // CSS の .layer-thumb と一致させること（行の高さはほぼこの値で決まる）。
@@ -459,6 +466,18 @@ export function CanvasEditor({
   const zoomDragRef = useRef<{ startY: number; startZoom: number; anchorX: number; anchorY: number } | null>(
     null,
   );
+  // D 押下中のドラッグ = 表示の回転。画面中央を軸に、ペンの角度の変化ぶんだけ連続的に回す。
+  const rotateDragRef = useRef<{
+    startAngle: number; // 押下時の「画面中央→ペン」の角度 [rad]
+    startRot: number; // 押下時の回転 [deg]
+    pan0: { x: number; y: number };
+    vx: number; // 回転軸（ビューポート座標）
+    vy: number;
+    px: number; // 回転軸（client 座標）
+    py: number;
+  } | null>(null);
+  const panLayerRef = useRef<HTMLDivElement>(null); // .canvas-pan（scale と rotate を担う）
+  const rotLabelRef = useRef<HTMLSpanElement>(null); // 回転角の表示（ジェスチャ中は命令的に更新）
   // レイヤーパネルの D&D 並べ替えでドラッグ中のノード id。
   const dragIdRef = useRef<string | null>(null);
   // ドラッグを掴んだ位置（クライアント座標）。ここからの横移動量で「縦に積む／横に並べる」を分ける。
@@ -504,6 +523,7 @@ export function CanvasEditor({
   const [tool, setTool] = useState<Tool>('brush');
   const [sizeAdjust, setSizeAdjust] = useState(false); // S キー押下中 = 太さ調整モード
   const [zoomKey, setZoomKey] = useState(false); // Z キー押下中 = ズームモード
+  const [rotateKey, setRotateKey] = useState(false); // D キー押下中 = 回転モード
   const [spaceHeld, setSpaceHeld] = useState(false); // Space 長押し = 視点移動（パン）モード
 
   // ---- 描画色: メイン / サブ / 透明 の3枠（クリスタと同じ持ち方） --------------
@@ -575,8 +595,25 @@ export function CanvasEditor({
   const [warpCount, setWarpCount] = useState(warp.count);
   const [warpMsg, setWarpMsg] = useState('');
   const [calibArea, setCalibArea] = useState<CalibArea | null>(null);
+  const [calibMap, setCalibMap] = useState<CalibMap | null>(null);
+  // キャリブレーション（学習）と効果テスト（学習しない）は同じ全画面オーバーレイ領域を使う
+  const [overlayKind, setOverlayKind] = useState<'calib' | 'test'>('calib');
+  const [showWarpGrid, setShowWarpGrid] = useState(false); // 場のゆがみを碁盤の目で表示
+  const [warpGridExag, setWarpGridExag] = useState(false); // 表示だけ ×4 に強調
+  const [warpVer, setWarpVer] = useState(0); // 場が変わったら格子表示を描き直す
+  const [warpLast, setWarpLast] = useState(warp.lastStroke); // 直前の線で実際に足した変位
+  const warpGridRef = useRef<HTMLCanvasElement>(null);
   /** キャリブレーション開始。ガイドはキャンバスが画面に見えている範囲に出す。 */
-  const startCalibration = () => {
+  const startCalibration = (kind: 'calib' | 'test' = 'calib') => {
+    // キャリブレーション・効果テストは回転 0° で行う（場を画面の向きで学習・評価するため）。
+    // 回転を戻したら、レイアウトが反映されてから位置を測る。
+    if (rotRef.current !== 0) {
+      rotateTo(0);
+      setWarpMsg('キャリブレーション・効果テストは回転 0° で行うため、表示の回転を戻しました');
+      requestAnimationFrame(() => requestAnimationFrame(() => startCalibration(kind)));
+      return;
+    }
+    setOverlayKind(kind);
     const c = canvasRef.current;
     const vp = viewportRef.current;
     if (!c) return;
@@ -586,12 +623,16 @@ export function CanvasEditor({
     const top = Math.max(r.top, v.top);
     const right = Math.min(r.right, v.right);
     const bottom = Math.min(r.bottom, v.bottom);
+    setCalibMap({ left: r.left, top: r.top, scale: c.width / r.width });
     setCalibArea({ left, top, width: Math.max(right - left, 100), height: Math.max(bottom - top, 100) });
   };
   const [zoom, setZoom] = useState(1);
   // パン(視点移動)は scroll ではなく transform で行う（キャンバスが画面に収まっていても動かせる）。
   // pan = キャンバス左上のビューポート左上からのオフセット(px)。
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  // 表示の回転（度）。視点操作なので画素・操作ログには影響しない。キャンバス中心まわりに回し、
+  // 見ている所（画面中央）がずれないよう pan で補う。
+  const [rotation, setRotation] = useState(0);
   const [opacityDraft, setOpacityDraft] = useState<{ id: string; v: number } | null>(null);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
@@ -913,6 +954,8 @@ export function CanvasEditor({
       if (e.ctrlKey || e.metaKey || isField(e.target)) return;
       if (e.key === 's' || e.key === 'S') setSizeAdjust(true);
       if (e.key === 'z' || e.key === 'Z') setZoomKey(true);
+      // e.code も見る（日本語入力が ON でも D の押下を拾えるように）
+      if (e.key === 'd' || e.key === 'D' || e.code === 'KeyD') setRotateKey(true);
       if (e.key === ' ') {
         setSpaceHeld(true);
         e.preventDefault(); // ページスクロール/ボタン誤発火を防ぐ
@@ -921,11 +964,13 @@ export function CanvasEditor({
     const up = (e: KeyboardEvent) => {
       if (e.key === 's' || e.key === 'S') setSizeAdjust(false);
       if (e.key === 'z' || e.key === 'Z') setZoomKey(false);
+      if (e.key === 'd' || e.key === 'D' || e.code === 'KeyD') setRotateKey(false);
       if (e.key === ' ') setSpaceHeld(false);
     };
     const reset = () => {
       setSizeAdjust(false);
       setZoomKey(false);
+      setRotateKey(false);
       setSpaceHeld(false);
     };
     window.addEventListener('keydown', down);
@@ -948,6 +993,87 @@ export function CanvasEditor({
   // 古い state に巻き戻さない。非ジェスチャ時は通常どおり state と同期する。
   if (!panGestureRef.current) panRef.current = pan;
   const clampZoom = (z: number) => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+
+  // ---- 表示の回転 ----
+  const rotRef = useRef(rotation);
+  if (!panGestureRef.current) rotRef.current = rotation;
+  /** .canvas-pan の transform。scale は原点基準のまま（pan/zoom の計算を変えない）、回転だけキャンバス中心まわり。 */
+  const panLayerTransform = (z: number, deg: number) =>
+    deg === 0
+      ? `scale(${z})`
+      : `scale(${z}) translate(${width / 2}px, ${height / 2}px) rotate(${deg}deg) translate(${-width / 2}px, ${-height / 2}px)`;
+  const fmtDeg = (deg: number) => `${Math.round(deg)}°`;
+  /**
+   * 回転を fromDeg → deg に変えても、ビューポート上の点 (vx, vy) にあった絵が動かないような pan を返す。
+   * キャンバス中心 C まわりに d だけ回すと、V にあった点は C + R(d)(V − C) へ行くので、
+   * 中心を C' = V − R(d)(V − C) へずらせば V に留まる。
+   */
+  const panForRotation = (deg: number, fromDeg: number, fromPan: { x: number; y: number }, vx: number, vy: number) => {
+    const z = zoomRef.current;
+    const cx = fromPan.x + (width * z) / 2;
+    const cy = fromPan.y + (height * z) / 2;
+    const d = ((deg - fromDeg) * Math.PI) / 180;
+    const rx = vx - cx;
+    const ry = vy - cy;
+    const nx = vx - (rx * Math.cos(d) - ry * Math.sin(d));
+    const ny = vy - (rx * Math.sin(d) + ry * Math.cos(d));
+    return { x: fromPan.x + (nx - cx), y: fromPan.y + (ny - cy) };
+  };
+  /** ジェスチャ中の回転を命令的に適用（再レンダーを挟まない。確定は pointerup で state へ）。 */
+  const applyRotation = (deg: number, p: { x: number; y: number }) => {
+    rotRef.current = deg;
+    const el = panLayerRef.current;
+    if (el) el.style.transform = panLayerTransform(zoomRef.current, deg);
+    if (rotLabelRef.current) rotLabelRef.current.textContent = fmtDeg(deg);
+    applyPan(p);
+  };
+  /** 画面中央を軸に、回転を deg にする（リセット等）。 */
+  const rotateTo = (deg: number) => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    flushPanGesture();
+    const p = panForRotation(deg, rotRef.current, panRef.current, vp.clientWidth / 2, vp.clientHeight / 2);
+    rotRef.current = deg;
+    setRotation(deg);
+    setPan(p);
+  };
+  /** D＋ドラッグの開始。 */
+  const startRotateDrag = (e: ReactPointerEvent) => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    e.preventDefault();
+    flushPanGesture();
+    panGestureRef.current = true; // ジェスチャ中の巻き添え再レンダーで pan/回転を巻き戻さない
+    const r = vp.getBoundingClientRect();
+    const vx = vp.clientWidth / 2;
+    const vy = vp.clientHeight / 2;
+    const px = r.left + vx;
+    const py = r.top + vy;
+    rotateDragRef.current = {
+      startAngle: Math.atan2(e.clientY - py, e.clientX - px),
+      startRot: rotRef.current,
+      pan0: { ...panRef.current },
+      vx,
+      vy,
+      px,
+      py,
+    };
+    capturePointer(canvasRef.current, e.pointerId);
+  };
+  const moveRotateDrag = (e: ReactPointerEvent) => {
+    const d = rotateDragRef.current!;
+    let deg = d.startRot + ((Math.atan2(e.clientY - d.py, e.clientX - d.px) - d.startAngle) * 180) / Math.PI;
+    deg = ((((deg + 180) % 360) + 360) % 360) - 180; // −180〜180 に正規化
+    if (e.shiftKey) deg = Math.round(deg / 15) * 15; // Shift: 15° 刻み
+    else if (Math.abs(deg) < 1.5) deg = 0; // 0° 付近は吸着（真っ直ぐに戻しやすく）
+    applyRotation(deg, panForRotation(deg, d.startRot, d.pan0, d.vx, d.vy));
+  };
+  const endRotateDrag = () => {
+    rotateDragRef.current = null;
+    flushPanGesture();
+    setRotation(rotRef.current);
+    setPan(panRef.current);
+  };
 
   // pan を命令的に適用する（React 再レンダーを介さず stage の transform を直接書き換える）。
   // これにより高頻度の wheel/ドラッグでも巨大コンポーネントの再レンダーが走らず、pan がなめらかになる。
@@ -1121,11 +1247,35 @@ export function CanvasEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [width, height]);
 
-  const getPoint = (e: ReactPointerEvent): StrokePoint => {
+  /**
+   * 画面座標 → キャンバス座標の変換関数を作る。表示の回転・ズームを打ち消す。
+   * 回転していると外接矩形の左上はキャンバスの左上ではなくなるが、外接矩形の中心はキャンバスの中心と
+   * 一致するので、中心からの差を逆回転・等倍に戻してから、キャンバス中心を足す。
+   */
+  const clientToCanvasFn = () => {
     const c = canvasRef.current!;
-    const rect = c.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (c.width / rect.width);
-    const y = (e.clientY - rect.top) * (c.height / rect.height);
+    const rect = c.getBoundingClientRect(); // 1 イベント 1 回だけ取る
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const cssW = c.offsetWidth || width; // レイアウト上の幅（transform の影響を受けない）
+    const cssH = c.offsetHeight || height;
+    const z = zoomRef.current;
+    const th = (-rotRef.current * Math.PI) / 180;
+    const cos = Math.cos(th);
+    const sin = Math.sin(th);
+    const kx = c.width / cssW;
+    const ky = c.height / cssH;
+    return (clientX: number, clientY: number): [number, number] => {
+      const dx = clientX - cx;
+      const dy = clientY - cy;
+      const ux = (dx * cos - dy * sin) / z + cssW / 2;
+      const uy = (dx * sin + dy * cos) / z + cssH / 2;
+      return [ux * kx, uy * ky];
+    };
+  };
+
+  const getPoint = (e: ReactPointerEvent): StrokePoint => {
+    const [x, y] = clientToCanvasFn()(e.clientX, e.clientY);
     const pressure = e.pointerType === 'mouse' ? 1 : e.pressure > 0 ? e.pressure : 0.5;
     return { x, y, pressure };
   };
@@ -1138,30 +1288,90 @@ export function CanvasEditor({
     const native = e.nativeEvent;
     const evs = typeof native.getCoalescedEvents === 'function' ? native.getCoalescedEvents() : [];
     if (evs.length === 0) return [getPoint(e)];
-    const c = canvasRef.current!;
-    const rect = c.getBoundingClientRect(); // 矩形取得は1イベント1回だけ（点ごとには引かない）
-    const sx = c.width / rect.width;
-    const sy = c.height / rect.height;
-    return evs.map((ev) => ({
-      x: (ev.clientX - rect.left) * sx,
-      y: (ev.clientY - rect.top) * sy,
-      pressure: ev.pointerType === 'mouse' ? 1 : ev.pressure > 0 ? ev.pressure : 0.5,
-    }));
+    const toCanvas = clientToCanvasFn(); // 矩形取得は1イベント1回だけ（点ごとには引かない）
+    return evs.map((ev) => {
+      const [x, y] = toCanvas(ev.clientX, ev.clientY);
+      return { x, y, pressure: ev.pointerType === 'mouse' ? 1 : ev.pressure > 0 ? ev.pressure : 0.5 };
+    });
   };
 
   /**
-   * ブラシ入力点を場のゆがみで補正する。場は画面（client px）基準で持つので、
-   * キャンバス座標 → client 座標に戻して変位を求め、変位をキャンバス座標の倍率に直して足す。
+   * 場の変位を、いまの表示の回転に合わせて向きを直す。場は回転 0° のキャリブレーションで学習しているので
+   * 変位は「画面上の向き」。手のクセも画面（＝タブレット）上の向きに付くため、表示を θ 回しているときは
+   * 変位を −θ 回してからキャンバス座標に足す。
    */
-  const warpPoints = (pts: StrokePoint[]): StrokePoint[] => {
-    const c = canvasRef.current!;
-    const rect = c.getBoundingClientRect();
-    const sx = c.width / rect.width;
-    const sy = c.height / rect.height;
-    return pts.map((p) => {
-      const [dx, dy] = warp.feed(rect.left + p.x / sx, rect.top + p.y / sy);
-      return dx === 0 && dy === 0 ? p : { ...p, x: p.x + dx * sx, y: p.y + dy * sy };
+  const rotateDisp = (dx: number, dy: number): [number, number] => {
+    if (rotRef.current === 0) return [dx, dy];
+    const th = (-rotRef.current * Math.PI) / 180;
+    return [dx * Math.cos(th) - dy * Math.sin(th), dx * Math.sin(th) + dy * Math.cos(th)];
+  };
+
+  /** ブラシ入力点を場のゆがみで補正する（場はキャンバス座標で持つ）。 */
+  const warpPoints = (pts: StrokePoint[]): StrokePoint[] =>
+    pts.map((p) => {
+      const [dx, dy] = rotateDisp(...warp.feed(p.x, p.y));
+      return dx === 0 && dy === 0 ? p : { ...p, x: p.x + dx, y: p.y + dy };
     });
+
+  // 変形範囲＝キャンバス。サイズが変わったら制御格子を張り直す。
+  useEffect(() => {
+    warp.setCanvas(width, height);
+    setWarpCount(warp.count);
+    setWarpVer((v) => v + 1);
+  }, [warp, width, height]);
+
+  // 場のゆがみを碁盤の目で表示。各交点を「そこにペンを置いたら線が出る位置」へ動かして描く。
+  useEffect(() => {
+    const c = warpGridRef.current;
+    if (!c) return;
+    const g = c.getContext('2d')!;
+    g.clearRect(0, 0, c.width, c.height);
+    if (!showWarpGrid) return;
+    const step = Math.min(width, height) / 18; // 19 路盤の目の細かさ
+    const sub = step / 4;
+    const ex = warpOn ? (warpGridExag ? 4 : 1) : 0;
+    const P = (x: number, y: number): [number, number] => {
+      const [dx, dy] = rotateDisp(...warp.displacementAt(x, y)); // 描画時と同じく回転に合わせる
+      return [x + ex * dx, y + ex * dy];
+    };
+    const lw = 1 / zoom; // 画面上で約 1px
+    // 元の格子（薄く）
+    g.strokeStyle = 'rgba(0,0,0,.15)';
+    g.lineWidth = lw;
+    g.beginPath();
+    for (let x = 0; x <= width + 0.5; x += step) {
+      g.moveTo(x, 0);
+      g.lineTo(x, height);
+    }
+    for (let y = 0; y <= height + 0.5; y += step) {
+      g.moveTo(0, y);
+      g.lineTo(width, y);
+    }
+    g.stroke();
+    // ゆがんだ格子
+    g.strokeStyle = 'rgba(215,70,30,.85)';
+    g.lineWidth = 1.5 * lw;
+    g.beginPath();
+    for (let x = 0; x <= width + 0.5; x += step) {
+      g.moveTo(...P(x, 0));
+      for (let y = sub; y <= height + 0.5; y += sub) g.lineTo(...P(x, Math.min(y, height)));
+    }
+    for (let y = 0; y <= height + 0.5; y += step) {
+      g.moveTo(...P(0, y));
+      for (let x = sub; x <= width + 0.5; x += sub) g.lineTo(...P(Math.min(x, width), y));
+    }
+    g.stroke();
+  }, [warp, showWarpGrid, warpGridExag, warpOn, warpStrength, warpCount, warpVer, width, height, zoom, rotation]);
+
+  // 場の大きさ（強さ 1 のとき）と、格子が折り返さない強さの上限。強さはここに掛けて表示する。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const warpStats = useMemo(() => warp.fieldStats(), [warp, warpCount, warpVer, width, height]);
+  /** 強さのスライダーと入力欄の共通処理。0 = 補正なしと同じ。 */
+  const setWarpStrengthValue = (v: number) => {
+    if (!Number.isFinite(v)) return;
+    warp.strength = Math.max(0, Math.min(WARP_STRENGTH_INPUT_MAX, v));
+    warp.save();
+    setWarpStrength(warp.strength);
   };
 
   const sizeCanvas = (ref: MutableRefObject<HTMLCanvasElement | null>): HTMLCanvasElement => {
@@ -1811,6 +2021,7 @@ export function CanvasEditor({
       capturePointer(canvasRef.current, e.pointerId);
     };
     if (e.button === 1 || spaceHeld) return startPan();
+    if (rotateKey) return startRotateDrag(e);
     if (zoomKey) {
       e.preventDefault();
       zoomDragRef.current = { startY: e.clientY, startZoom: zoomRef.current, anchorX: e.clientX, anchorY: e.clientY };
@@ -1832,6 +2043,11 @@ export function CanvasEditor({
       e.preventDefault();
       panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
       capturePointer(canvasRef.current, e.pointerId);
+      return;
+    }
+    // D 押下中（回転モード）: 画面中央を軸に、ペンをぐるっと動かした角度ぶん連続的に回す。
+    if (rotateKey) {
+      startRotateDrag(e);
       return;
     }
     // Z 押下中（ズームモード）: 押下位置をカーソル基準に、上下ドラッグで拡大/縮小。
@@ -1938,6 +2154,11 @@ export function CanvasEditor({
       if (hex) setColor(hex);
       return;
     }
+    // 回転ドラッグ中
+    if (rotateDragRef.current) {
+      moveRotateDrag(e);
+      return;
+    }
     // ズームドラッグ中: 上=拡大 / 下=縮小。押下時のカーソル位置を基準に保つ（zoomToAnchor）。
     if (zoomDragRef.current) {
       const d = zoomDragRef.current;
@@ -2027,6 +2248,10 @@ export function CanvasEditor({
       if (c) c.style.cursor = '';
       return;
     }
+    if (rotateDragRef.current) {
+      endRotateDrag();
+      return;
+    }
     if (zoomDragRef.current) {
       zoomDragRef.current = null;
       return;
@@ -2039,6 +2264,7 @@ export function CanvasEditor({
       const strokes = drawingRef.current.strokes;
       drawingRef.current = null;
       warp.end(); // 描画では学習しない（学習はキャリブレーションで行う）
+      setWarpLast(warp.lastStroke);
       teardownBrushPreview(); // 増分プレビューのキャッシュ/保留rAFを破棄（以降は決定的 repaint）
       if (strokes.length > 0) {
         const op = strokeOp(strokes);
@@ -3476,12 +3702,26 @@ export function CanvasEditor({
 
   return (
     <div className="editor" ref={paneRef}>
-      {calibArea && (
+      {calibArea && calibMap && overlayKind === 'test' && (
+        <WarpTest
+          warp={warp}
+          area={calibArea}
+          map={calibMap}
+          docSize={{ width, height }}
+          onClose={() => {
+            setCalibArea(null);
+            setWarpMsg('効果テストを終了しました（テスト中は学習していません）');
+          }}
+        />
+      )}
+      {calibArea && calibMap && overlayKind === 'calib' && (
         <WarpCalibration
           warp={warp}
           area={calibArea}
+          map={calibMap}
           onClose={(n) => {
             setCalibArea(null);
+            setWarpVer((v) => v + 1);
             setWarpCount(warp.count);
             setWarpStrength(warp.strength); // 最適化で強さが変わる
             setWarpMsg(n > 0 ? `キャリブレーション ${n} 本を学習しました` : '');
@@ -3489,7 +3729,7 @@ export function CanvasEditor({
         />
       )}
       <div
-        className={`canvas-viewport ${zoomKey ? 'zoom-mode' : ''} ${spaceHeld ? 'pan-mode' : ''}`}
+        className={`canvas-viewport ${zoomKey ? 'zoom-mode' : ''} ${spaceHeld ? 'pan-mode' : ''} ${rotateKey ? 'rotate-mode' : ''}`}
         ref={viewportRef}
         onPointerDown={onViewportPointerDown}
       >
@@ -3501,7 +3741,7 @@ export function CanvasEditor({
           className="canvas-stage"
           style={{ transform: `translate(${panRef.current.x}px, ${panRef.current.y}px)` }}
         >
-          <div className="canvas-pan" style={{ transform: `scale(${zoom})` }}>
+          <div ref={panLayerRef} className="canvas-pan" style={{ transform: panLayerTransform(zoom, rotRef.current) }}>
           {/* アートボード（最終画像になる矩形）。ライブ canvas をここに置く。白い紙が「枠の中」。 */}
           <div className="board-tile-host focused" style={{ left: focusX, top: focusY }}>
             <canvas
@@ -3536,6 +3776,14 @@ export function CanvasEditor({
               height={height}
               style={{ width, height }}
             />
+            {/* 場のゆがみの碁盤表示（当たり判定は持たない） */}
+            <canvas
+              ref={warpGridRef}
+              className="selection-overlay warp-grid-overlay"
+              width={width}
+              height={height}
+              style={{ width, height, display: showWarpGrid ? 'block' : 'none' }}
+            />
           </div>
         </div>
           {/* リサイズ・ドラッグ中に出す破線プレビュー枠（アートボード原点 0,0 起点）。大きさは命令的に更新。 */}
@@ -3545,7 +3793,7 @@ export function CanvasEditor({
               canvas-stage 内なので pan に追従し、scale の外なので見た目サイズは一定。 */}
           <div
             className="resize-handle resize-handle-right"
-            style={{ left: width * zoom, top: (height * zoom) / 2 }}
+            style={{ left: width * zoom, top: (height * zoom) / 2, display: rotation !== 0 ? 'none' : undefined }}
             title="ドラッグで幅を変更（内容は消えません）"
             onPointerDown={(e) => onResizeHandleDown('w', e)}
             onPointerMove={onResizeHandleMove}
@@ -3556,7 +3804,7 @@ export function CanvasEditor({
           </div>
           <div
             className="resize-handle resize-handle-bottom"
-            style={{ left: (width * zoom) / 2, top: height * zoom }}
+            style={{ left: (width * zoom) / 2, top: height * zoom, display: rotation !== 0 ? 'none' : undefined }}
             title="ドラッグで高さを変更（内容は消えません）"
             onPointerDown={(e) => onResizeHandleDown('h', e)}
             onPointerMove={onResizeHandleMove}
@@ -3607,6 +3855,15 @@ export function CanvasEditor({
         </span>
         <span className={`keyhint-badge ${spaceHeld ? 'on' : ''}`} title="Space を押しながらドラッグで視点移動">
           Space＝視点移動
+        </span>
+        <span ref={rotLabelRef} className="zoom-val" onClick={() => rotateTo(0)} title="表示の回転。クリックで 0° に戻す">
+          {fmtDeg(rotation)}
+        </span>
+        <span
+          className={`keyhint-badge ${rotateKey ? 'on' : ''}`}
+          title="D を押しながら、画面中央のまわりに円を描くようにドラッグで回転（Shift で 15° 刻み）。角度の表示をクリックで 0° に戻る"
+        >
+          D＋ドラッグ＝回転
         </span>
       </div>
 
@@ -3793,24 +4050,70 @@ export function CanvasEditor({
               補正 {warpOn ? 'ON' : 'OFF'}
             </span>
           </label>
-          <label className="field">
-            <span>強さ {warpStrength.toFixed(2)}</span>
+          <label className="field" title="学習した変位に掛ける倍率。0 で補正なし、1 で学習どおり。観察用に従来の上限 1.5 を超えて上げられる">
+            <span>
+              強さ{' '}
+              <input
+                type="number"
+                className="warp-strength-input"
+                min={0}
+                max={WARP_STRENGTH_INPUT_MAX}
+                step={0.1}
+                value={Number(warpStrength.toFixed(2))}
+                onChange={(e) => setWarpStrengthValue(Number(e.target.value))}
+              />{' '}
+              倍
+            </span>
             <input
               type="range"
               min={0}
-              max={1.5}
+              max={WARP_STRENGTH_SLIDER_MAX}
               step={0.05}
-              value={warpStrength}
-              onChange={(e) => {
-                warp.strength = Number(e.target.value);
-                warp.save();
-                setWarpStrength(warp.strength);
-              }}
+              value={Math.min(warpStrength, WARP_STRENGTH_SLIDER_MAX)}
+              onChange={(e) => setWarpStrengthValue(Number(e.target.value))}
             />
           </label>
+          <div className="btn-group">
+            {WARP_STRENGTH_PRESETS.map((v) => (
+              <button
+                key={v}
+                className={Math.abs(warpStrength - v) < 1e-6 ? 'active' : ''}
+                onClick={() => setWarpStrengthValue(v)}
+                title={v === 0 ? '補正なし（入力座標を変えない）' : v === 1.5 ? '従来のスライダーの上限' : `${v} 倍`}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
+          <div className="hint">0 = 補正なし ／ 1 = 学習どおり ／ 1.5 = 従来の上限（スライダーは 10 倍、入力欄は 50 倍まで）</div>
+          <div className="hint warp-disp">
+            {warpCount === 0 ? (
+              '学習データがないため、変位は 0 px です。'
+            ) : (
+              <>
+                適用される変位（強さ {warpStrength.toFixed(2)} 倍{warpOn ? '' : '・いまは補正 OFF のため実際は 0'}）：
+                最大 <b>{(warpStats.maxDisp * warpStrength).toFixed(1)}</b> px ／ キャンバス平均{' '}
+                {(warpStats.meanDisp * warpStrength).toFixed(1)} px（キャンバス px。画面上は ×{zoom.toFixed(2)}）
+                <br />
+                格子が折り返さない強さの上限 ≈{' '}
+                {Number.isFinite(warpStats.foldStrength) ? warpStats.foldStrength.toFixed(1) : '∞'} 倍
+                {warpStrength > warpStats.foldStrength && (
+                  <span className="warp-warn">（超えています：場所によって線が逆向きに動きます）</span>
+                )}
+                <br />
+                直前の線で実際に足した変位：平均 {warpLast.mean.toFixed(1)} px ／ 最大 {warpLast.max.toFixed(1)} px
+              </>
+            )}
+          </div>
           <div className="tool-row">
-            <button className="primary" onClick={startCalibration} title="ガイド線をなぞって手のズレを学習する">
+            <button className="primary" onClick={() => startCalibration('calib')} title="ガイド線をなぞって手のズレを学習する">
               キャリブレーション
+            </button>
+            <button
+              onClick={() => startCalibration('test')}
+              title="補正あり・なしを同じお手本で描き比べ、描きやすくなったかを数値で確かめる（学習しない）"
+            >
+              効果テスト
             </button>
           </div>
           <div className="tool-row">
@@ -3820,17 +4123,33 @@ export function CanvasEditor({
                 if (!window.confirm('学習した場のゆがみを消去しますか？')) return;
                 warp.reset();
                 setWarpCount(0);
+                setWarpVer((v) => v + 1);
                 setWarpMsg('学習をリセットしました');
               }}
             >
               学習リセット
             </button>
           </div>
+          <label className="field" title="キャンバス上に、補正による場のゆがみを碁盤の目で重ねて表示する">
+            <span>
+              <input type="checkbox" checked={showWarpGrid} onChange={(e) => setShowWarpGrid(e.target.checked)} />{' '}
+              ゆがみを碁盤の目で表示
+            </span>
+          </label>
+          {showWarpGrid && (
+            <label className="field" title="表示だけ 4 倍に強調する（補正の強さは変わらない）">
+              <span>
+                <input type="checkbox" checked={warpGridExag} onChange={(e) => setWarpGridExag(e.target.checked)} />{' '}
+                表示を ×4 に強調
+              </span>
+            </label>
+          )}
           {warpMsg && <p className="hint">{warpMsg}</p>}
           <p className="hint">
             キャリブレーションで始点・終点・経路を指定したガイド（直線 / 円弧 / S字）をなぞると、手のズレを
-            場のゆがみとして学習し、ズレ方の傾向に合わせて補正のかけ方を最適化します。描画中は学習せず、
-            学習済みの場で入力を補正するだけです（ブラシ / 消しゴムのみ）。
+            学習し、キャンバス全体をなめらかなメッシュとしてゆがめます。描画中は学習せず、学習済みの場で
+            入力を補正するだけです（ブラシ / 消しゴムのみ）。碁盤の目は、各交点にペンを置いたとき線が出る
+            位置を表します。
           </p>
         </Section>
 

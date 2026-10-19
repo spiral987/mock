@@ -1,36 +1,39 @@
 /**
  * 場のゆがみ補正（Warp Field）— 方向性を確かめるための最小実装。
  *
- * 「描きたい線」と「実際に引ける線」のズレを、作業領域の変位場 D として学習し、ペン入力をゆがめて補正する。
+ * キャンバス全体を変形範囲とする「なめらかなメッシュ変形」として、ペン入力をゆがめる。
  *
- *   表示位置 = 生の入力位置 + strength · D(x, y, θ, κ)
+ *   表示位置 = 生の入力位置 + strength · D(x, y)
  *
- *   x, y : ペン位置（client px。手のクセは物理的な動きに付くので、ズーム/パンに依存させない）
- *   θ    : 進行方向
- *   κ    : 今描いている線の曲がり具合（符号付き曲率）
+ *   D はキャンバス上に張った粗い制御格子（1 辺 CELLS マス）の各節点の変位を、3 次 B スプラインで
+ *   なめらかに補間したもの。位置だけで決まる滑らかな場なので、描画中に細かく揺れない。
+ *   座標はキャンバス座標（px）。
  *
  * 学習（描画とは分離）:
  *   キャリブレーションで「始点・終点・経路」を指定したガイド（直線 / 円弧 / S字）をなぞってもらう。
- *   ガイドが「理想の線」なので、なぞった各点を経路上の対応点（進行に沿って単調に対応付け）と比べ、
- *   その差をサンプルとして蓄える。D はサンプルからのカーネル回帰で求める。
+ *   なぞった各点を経路上の対応点（進行に沿って単調に対応付け）と比べた差をサンプルとし、
+ *   「サンプルへの当てはまり + なめらかさ（隣の節点との差）+ 0 への引き戻し」を最小にする
+ *   節点の変位を最小二乗で解く。データの無い場所は、なめらかさの項で周囲から補われ、遠くでは 0 に戻る。
  *
  * 最適化:
- *   ズレ方の傾向は人によって「場所」「方向」「曲がり具合」のどれに強く依存するかが違う。
- *   そこでカーネルの幅（空間 / 方向 / 曲率）と補正の強さを、試行ごとの交差検証
- *   （ある試行を、他の試行だけで学習した場で補正したときの誤差）が最小になるように選ぶ。
+ *   なめらかさの強さ λ と補正の強さを、試行ごとの交差検証
+ *   （ある試行を、他の試行だけで解いた場で補正したときの誤差）が最小になるように選ぶ。
  */
 
 export type Pt = { x: number; y: number };
 export type PathKind = 'line' | 'arc' | 's';
 export const KIND_LABEL: Record<PathKind, string> = { line: '直線', arc: '円弧', s: 'S字' };
 
-type Feat = { a: number | null; k: number; beta: number };
-type Sample = { x: number; y: number; a: number; k: number; dx: number; dy: number; trial: number };
+type Sample = { x: number; y: number; dx: number; dy: number };
 type Trial = { id: number; kind: PathKind; path: Pt[]; raw: Pt[] };
 
-/** sigA / sigK が 0 のときはその特徴を使わない（場所だけ・方向だけ…の場になる）。 */
-export type Params = { sigS: number; sigA: number; sigK: number; strength: number };
+/** smooth: なめらかさ λ（大きいほど場がゆるやかに歪む）, strength: 補正の強さ */
+export type Params = { smooth: number; strength: number };
 export type TraceResult = { ok: boolean; rawErr: number; shownErr: number };
+/** 場の大きさ（強さ 1 のとき）と、格子が折り返さない強さの上限。補正量の確認用。 */
+export type FieldStats = { maxDisp: number; meanDisp: number; foldStrength: number };
+/** 直前の 1 本で実際に足した変位（キャンバス px、強さ込み・補正 OFF なら 0）。 */
+export type StrokeDisp = { mean: number; max: number; n: number };
 export type OptResult = { trials: number; before: number; defaultErr: number; after: number; params: Params };
 export type Tendency = {
   byKind: { kind: PathKind; n: number; err: number; lateral: number; outward: number | null }[];
@@ -38,24 +41,48 @@ export type Tendency = {
   byDir: { deg: number; err: number }[];
 };
 
-const STORE_KEY = 'mock.warpField.v2';
-const DEFAULT_PARAMS: Params = { sigS: 70, sigA: 0.5, sigK: 0, strength: 1 };
-const LAMBDA = 0.6; // データが少ない場所では変位を 0 へ縮める
+const STORE_KEY = 'mock.warpField.v3';
+const DEFAULT_PARAMS: Params = { smooth: 30, strength: 1 };
+const SMOOTH_GRID = [10, 30, 100, 300, 1000]; // 小さすぎる λ は局所的な歪み（描画時のブレ）の元になるので使わない
+const STRENGTH_GRID = [0.5, 0.75, 1];
+const CELLS = 8; // キャンバスの長辺を何マスの制御格子で覆うか
+const RIDGE_RATIO = 1 / 16; // 0 への引き戻し = λ × これ（データの無い所の減衰距離 ≈ 4 マス）
 const MAX_TRIALS = 120; // 古い試行から捨てる（最近の手癖を優先）
 const OPT_TRIALS = 40; // 最適化に使う直近の試行数
 const SAMPLE_STEP = 8; // 学習サンプルの間引き [px]
 const STORE_STEP = 2; // 保存する軌跡の間引き [px]
-const DIR_DIST = 12; // 進行方向の推定距離 [px]
-const CURV_DIST = 20; // 曲率の推定に使う弦の長さ [px]
+
+/** 3 次 B スプラインの基底（台は ±2）。 */
+function bspline(t: number): number {
+  const a = Math.abs(t);
+  if (a < 1) return (4 - 6 * a * a + 3 * a * a * a) / 6;
+  if (a < 2) return ((2 - a) * (2 - a) * (2 - a)) / 6;
+  return 0;
+}
 
 export class WarpField {
   enabled = true;
   params: Params = { ...DEFAULT_PARAMS };
   private trials: Trial[] = [];
-  private samples: Sample[] = [];
   private nextId = 1;
   private raw: Pt[] | null = null;
   private shown: Pt[] = [];
+  // 1 本のあいだに実際に足した変位の集計（補正量の確認用）
+  private dispSum = 0;
+  private dispMax = 0;
+  private dispN = 0;
+  lastStroke: StrokeDisp = { mean: 0, max: 0, n: 0 };
+  // 制御格子
+  private W = 0;
+  private H = 0;
+  private h = 1; // 節点間隔 [px]
+  private nx = 0;
+  private ny = 0;
+  private cx: Float64Array = new Float64Array(0);
+  private cy: Float64Array = new Float64Array(0);
+  private nSamples = 0;
+  /** 学習データのあるマス（節点間隔の半分の格子）。効果テストで「学習範囲の内/外」の判定に使う。 */
+  private covered = new Set<string>();
 
   constructor() {
     try {
@@ -65,7 +92,6 @@ export class WarpField {
         if (typeof d.enabled === 'boolean') this.enabled = d.enabled;
         if (d.params) this.params = { ...DEFAULT_PARAMS, ...d.params };
         this.nextId = this.trials.reduce((m, t) => Math.max(m, t.id + 1), 1);
-        this.rebuild();
       }
     } catch {
       /* 保存が読めなくても空の場で動く */
@@ -79,7 +105,7 @@ export class WarpField {
     this.params.strength = v;
   }
   get count(): number {
-    return this.samples.length;
+    return this.nSamples;
   }
   get trialCount(): number {
     return this.trials.length;
@@ -98,9 +124,74 @@ export class WarpField {
 
   reset(): void {
     this.trials = [];
-    this.samples = [];
     this.params = { ...DEFAULT_PARAMS };
+    this.fit();
     this.save();
+  }
+
+  /** 変形範囲（キャンバスサイズ）を設定。サイズが変わったら格子を張り直して解き直す。 */
+  setCanvas(W: number, H: number): void {
+    if (W === this.W && H === this.H) return;
+    this.W = W;
+    this.H = H;
+    this.h = Math.max(W, H) / CELLS;
+    this.nx = Math.ceil(W / this.h) + 3;
+    this.ny = Math.ceil(H / this.h) + 3;
+    this.fit();
+  }
+
+  /* ------------------------------------------------------------ 場の評価 */
+
+  /** 点 (x,y) に効く節点（最大 4×4）とその重み。 */
+  private basis(x: number, y: number): { idx: number[]; w: number[] } {
+    const u = x / this.h + 1; // 節点 i の位置は (i-1)·h
+    const v = y / this.h + 1;
+    const iu = Math.floor(u);
+    const iv = Math.floor(v);
+    const idx: number[] = [];
+    const w: number[] = [];
+    for (let j = iv - 1; j <= iv + 2; j++) {
+      if (j < 0 || j >= this.ny) continue;
+      const bv = bspline(v - j);
+      if (bv === 0) continue;
+      for (let i = iu - 1; i <= iu + 2; i++) {
+        if (i < 0 || i >= this.nx) continue;
+        const bu = bspline(u - i);
+        if (bu === 0) continue;
+        idx.push(j * this.nx + i);
+        w.push(bu * bv);
+      }
+    }
+    return { idx, w };
+  }
+
+  private evalWith(cx: Float64Array, cy: Float64Array, x: number, y: number): [number, number] {
+    const { idx, w } = this.basis(x, y);
+    let dx = 0;
+    let dy = 0;
+    for (let k = 0; k < idx.length; k++) {
+      dx += w[k] * cx[idx[k]];
+      dy += w[k] * cy[idx[k]];
+    }
+    return [dx, dy];
+  }
+
+  /** 学習済みの場の変位（強さ込み、補正 ON/OFF には依らない）。格子表示にも使う。 */
+  displacementAt(x: number, y: number): [number, number] {
+    if (this.cx.length === 0) return [0, 0];
+    const [dx, dy] = this.evalWith(this.cx, this.cy, x, y);
+    return [this.params.strength * dx, this.params.strength * dy];
+  }
+
+  /** (x,y) の近く（そのマスか隣のマス）に学習データがあるか。 */
+  isCovered(x: number, y: number): boolean {
+    const c = this.h / 2;
+    const i = Math.floor(x / c);
+    const j = Math.floor(y / c);
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) if (this.covered.has(`${i + di},${j + dj}`)) return true;
+    }
+    return false;
   }
 
   /* ------------------------------------------------------------ 入力の補正 */
@@ -108,62 +199,78 @@ export class WarpField {
   begin(): void {
     this.raw = [];
     this.shown = [];
+    this.dispSum = 0;
+    this.dispMax = 0;
+    this.dispN = 0;
   }
 
-  /** 生の入力点（client px）を記録し、表示に使う変位（client px）を返す。 */
+  /** 生の入力点（キャンバス px）を記録し、表示に使う変位を返す。 */
   feed(x: number, y: number): [number, number] {
-    const raw = this.raw ?? (this.raw = []);
-    raw.push({ x, y });
-    const f = featureAt(raw, raw.length - 1);
-    const d = this.enabled ? this.displacement(x, y, f, this.params) : ([0, 0] as [number, number]);
+    (this.raw ?? (this.raw = [])).push({ x, y });
+    const d = this.enabled ? this.displacementAt(x, y) : ([0, 0] as [number, number]);
     this.shown.push({ x: x + d[0], y: y + d[1] });
+    const m = Math.hypot(d[0], d[1]);
+    this.dispSum += m;
+    this.dispMax = Math.max(this.dispMax, m);
+    this.dispN++;
     return d;
   }
 
   /** キャンバスへの描画ストロークの終了。描画からは学習しない。 */
   end(): void {
+    this.lastStroke = { mean: this.dispN ? this.dispSum / this.dispN : 0, max: this.dispMax, n: this.dispN };
     this.raw = null;
     this.shown = [];
   }
 
-  private displacement(x: number, y: number, f: Feat, p: Params, exclude = -1): [number, number] {
-    if (this.samples.length === 0 || p.strength === 0) return [0, 0];
-    // 書き始めは方向・曲率が定まらないので、それらを無視した場とブレンドして跳びを防ぐ。
-    let [dx, dy] = this.predict(x, y, null, 0, p, exclude);
-    if (f.a !== null && f.beta > 0 && (p.sigA > 0 || p.sigK > 0)) {
-      const [ex, ey] = this.predict(x, y, f.a, f.k, p, exclude);
-      dx = (1 - f.beta) * dx + f.beta * ex;
-      dy = (1 - f.beta) * dy + f.beta * ey;
+  /**
+   * 学習済みの場の大きさ（強さ 1 のとき）をキャンバス全体で調べる。
+   * あわせて、写像 p → p + s·D(p) が折り返さない（格子が裏返らない）強さ s の上限を求める。
+   * 各点のヤコビアン I + s·∇D の行列式 1 + s·tr(∇D) + s²·det(∇D) が 0 になる最小の正の s。
+   */
+  fieldStats(): FieldStats {
+    if (this.W === 0 || this.cx.length === 0) return { maxDisp: 0, meanDisp: 0, foldStrength: Infinity };
+    const step = Math.max(this.W, this.H) / 48;
+    const nx = Math.floor(this.W / step) + 1;
+    const ny = Math.floor(this.H / step) + 1;
+    const D: [number, number][] = [];
+    let sum = 0;
+    let max = 0;
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const d = this.evalWith(this.cx, this.cy, Math.min(i * step, this.W), Math.min(j * step, this.H));
+        D.push(d);
+        const m = Math.hypot(d[0], d[1]);
+        sum += m;
+        max = Math.max(max, m);
+      }
     }
-    return [p.strength * dx, p.strength * dy];
-  }
-
-  private predict(x: number, y: number, a: number | null, k: number, p: Params, exclude: number): [number, number] {
-    let sw = 0;
-    let sx = 0;
-    let sy = 0;
-    const inv = 1 / (2 * p.sigS * p.sigS);
-    const cut = 9 * p.sigS * p.sigS;
-    const useA = a !== null && p.sigA > 0;
-    const useK = a !== null && p.sigK > 0;
-    const invA = useA ? 1 / (p.sigA * p.sigA) : 0;
-    const invK = useK ? 1 / (2 * p.sigK * p.sigK) : 0;
-    for (const s of this.samples) {
-      if (s.trial === exclude) continue;
-      const ex = s.x - x;
-      const ey = s.y - y;
-      const d2 = ex * ex + ey * ey;
-      if (d2 > cut) continue;
-      let e = -d2 * inv;
-      if (useA) e += (Math.cos(s.a - (a as number)) - 1) * invA;
-      if (useK) e -= (s.k - k) * (s.k - k) * invK;
-      const w = Math.exp(e);
-      sw += w;
-      sx += w * s.dx;
-      sy += w * s.dy;
+    let fold = Infinity;
+    for (let j = 0; j + 1 < ny; j++) {
+      for (let i = 0; i + 1 < nx; i++) {
+        const d0 = D[j * nx + i];
+        const dxp = D[j * nx + i + 1];
+        const dyp = D[(j + 1) * nx + i];
+        const a = (dxp[0] - d0[0]) / step; // ∂Dx/∂x
+        const b = (dyp[0] - d0[0]) / step; // ∂Dx/∂y
+        const c = (dxp[1] - d0[1]) / step; // ∂Dy/∂x
+        const e = (dyp[1] - d0[1]) / step; // ∂Dy/∂y
+        const tr = a + e;
+        const det = a * e - b * c;
+        let s = Infinity;
+        if (Math.abs(det) < 1e-12) {
+          if (tr < 0) s = -1 / tr;
+        } else {
+          const disc = tr * tr - 4 * det;
+          if (disc >= 0) {
+            const r = Math.sqrt(disc);
+            for (const root of [(-tr - r) / (2 * det), (-tr + r) / (2 * det)]) if (root > 0) s = Math.min(s, root);
+          }
+        }
+        fold = Math.min(fold, s);
+      }
     }
-    const kk = 1 / (sw + LAMBDA);
-    return [sx * kk, sy * kk];
+    return { maxDisp: max, meanDisp: sum / D.length, foldStrength: fold };
   }
 
   /* ------------------------------------------------------------ 学習 */
@@ -180,60 +287,148 @@ export class WarpField {
     if (raw.length < 3 || polyLen(raw) < polyLen(path) * 0.5) return { ok: false, rawErr: 0, shownErr: 0 };
     const rawErr = meanDist(raw, path);
     const shownErr = meanDist(shown, path);
-    const t: Trial = { id: this.nextId++, kind, path: thin(path, STORE_STEP), raw: thin(raw, STORE_STEP) };
-    this.trials.push(t);
+    this.trials.push({ id: this.nextId++, kind, path: thin(path, STORE_STEP), raw: thin(raw, STORE_STEP) });
     if (this.trials.length > MAX_TRIALS) this.trials.splice(0, this.trials.length - MAX_TRIALS);
-    this.rebuild();
+    this.fit();
     this.save();
     return { ok: true, rawErr, shownErr };
   }
 
-  /** 試行からサンプルを作り直す（各点を経路上の対応点と比べた差）。 */
-  private rebuild(): void {
-    this.samples = [];
-    for (const t of this.trials) {
-      for (const m of matchTrial(t)) {
-        if (m.f.a === null) continue;
-        this.samples.push({ x: m.p.x, y: m.p.y, a: m.f.a, k: m.f.k, dx: m.q.x - m.p.x, dy: m.q.y - m.p.y, trial: t.id });
+  private samplesOf(t: Trial): Sample[] {
+    return matchTrial(t).map((m) => ({ x: m.p.x, y: m.p.y, dx: m.q.x - m.p.x, dy: m.q.y - m.p.y }));
+  }
+
+  /** 正規方程式の寄与（データ項）を試行ごとに作る。 */
+  private normalOf(samples: Sample[]): { A: Float64Array; bx: Float64Array; by: Float64Array } {
+    const n = this.nx * this.ny;
+    const A = new Float64Array(n * n);
+    const bx = new Float64Array(n);
+    const by = new Float64Array(n);
+    for (const s of samples) {
+      const { idx, w } = this.basis(s.x, s.y);
+      for (let a = 0; a < idx.length; a++) {
+        bx[idx[a]] += w[a] * s.dx;
+        by[idx[a]] += w[a] * s.dy;
+        for (let b = 0; b < idx.length; b++) A[idx[a] * n + idx[b]] += w[a] * w[b];
       }
     }
+    return { A, bx, by };
+  }
+
+  /** なめらかさの行列（隣り合う節点の差の二乗和）+ 0 への引き戻し。 */
+  private regularizer(): Float64Array {
+    const n = this.nx * this.ny;
+    const R = new Float64Array(n * n);
+    const pair = (p: number, q: number) => {
+      R[p * n + p] += 1;
+      R[q * n + q] += 1;
+      R[p * n + q] -= 1;
+      R[q * n + p] -= 1;
+    };
+    for (let j = 0; j < this.ny; j++) {
+      for (let i = 0; i < this.nx; i++) {
+        const p = j * this.nx + i;
+        if (i + 1 < this.nx) pair(p, p + 1);
+        if (j + 1 < this.ny) pair(p, p + this.nx);
+        R[p * n + p] += RIDGE_RATIO;
+      }
+    }
+    return R;
+  }
+
+  /** (A + λR) c = b を解く。 */
+  private solve(A: Float64Array, R: Float64Array, lambda: number, bx: Float64Array, by: Float64Array) {
+    const n = bx.length;
+    const M = new Float64Array(n * n);
+    for (let k = 0; k < n * n; k++) M[k] = A[k] + lambda * R[k];
+    const L = cholesky(M, n);
+    return { cx: cholSolve(L, n, bx), cy: cholSolve(L, n, by) };
+  }
+
+  private fit(): void {
+    const n = this.nx * this.ny;
+    if (n === 0) return;
+    const all = this.trials.flatMap((t) => this.samplesOf(t));
+    this.nSamples = all.length;
+    const c = this.h / 2;
+    this.covered = new Set(all.map((s) => `${Math.floor(s.x / c)},${Math.floor(s.y / c)}`));
+    if (all.length === 0) {
+      this.cx = new Float64Array(n);
+      this.cy = new Float64Array(n);
+      return;
+    }
+    const { A, bx, by } = this.normalOf(all);
+    const { cx, cy } = this.solve(A, this.regularizer(), this.params.smooth, bx, by);
+    this.cx = cx;
+    this.cy = cy;
   }
 
   /* ------------------------------------------------------------ 最適化 */
 
   /**
-   * 交差検証（leave-one-trial-out）で、カーネル幅と強さを選ぶ。
-   * 評価点ごとの誤差は |strength·D(他の試行だけで学習) − 目標変位|。
+   * 交差検証（leave-one-trial-out）で、なめらかさ λ と強さを選ぶ。
+   * 評価点ごとの誤差は |strength·D(他の試行だけで解いた場) − 目標変位|。
    */
   optimize(): OptResult {
-    const recent = new Set(this.trials.slice(-OPT_TRIALS).map((t) => t.id));
-    const evalPts = this.samples.filter((s) => recent.has(s.trial));
-    const before = mean(evalPts.map((s) => Math.hypot(s.dx, s.dy)));
-    if (this.trials.length < 3 || evalPts.length === 0) {
+    const n = this.nx * this.ny;
+    const recent = this.trials.slice(-OPT_TRIALS);
+    const per = recent.map((t) => {
+      const s = this.samplesOf(t);
+      return { s, ...this.normalOf(s) };
+    });
+    // 最適化に使わない古い試行も、学習データとしては常に含める
+    const older = this.normalOf(this.trials.slice(0, -OPT_TRIALS).flatMap((t) => this.samplesOf(t)));
+    const evalCount = per.reduce((c, p) => c + p.s.length, 0);
+    const before = mean(per.flatMap((p) => p.s.map((s) => Math.hypot(s.dx, s.dy))));
+    if (recent.length < 3 || evalCount === 0 || n === 0) {
       return { trials: this.trials.length, before, defaultErr: before, after: before, params: this.params };
     }
-    const predsFor = (p: Params) =>
-      evalPts.map((s) => this.displacement(s.x, s.y, { a: s.a, k: s.k, beta: 1 }, { ...p, strength: 1 }, s.trial));
-    const cvErr = (strength: number, preds: [number, number][]) =>
-      mean(evalPts.map((s, i) => Math.hypot(strength * preds[i][0] - s.dx, strength * preds[i][1] - s.dy)));
-    const defaultErr = cvErr(DEFAULT_PARAMS.strength, predsFor(DEFAULT_PARAMS));
+    const At = new Float64Array(older.A);
+    const bxT = new Float64Array(older.bx);
+    const byT = new Float64Array(older.by);
+    for (const p of per) {
+      for (let k = 0; k < n * n; k++) At[k] += p.A[k];
+      for (let k = 0; k < n; k++) {
+        bxT[k] += p.bx[k];
+        byT[k] += p.by[k];
+      }
+    }
+    const R = this.regularizer();
+    // λ ごとに、各試行を抜いて解いた場で、その試行の点の予測変位を求める
+    const cvPreds = (lambda: number) => {
+      const preds: { s: Sample; d: [number, number] }[] = [];
+      for (const p of per) {
+        const A = new Float64Array(n * n);
+        for (let k = 0; k < n * n; k++) A[k] = At[k] - p.A[k];
+        const bx = new Float64Array(n);
+        const by = new Float64Array(n);
+        for (let k = 0; k < n; k++) {
+          bx[k] = bxT[k] - p.bx[k];
+          by[k] = byT[k] - p.by[k];
+        }
+        const { cx, cy } = this.solve(A, R, lambda, bx, by);
+        for (const s of p.s) preds.push({ s, d: this.evalWith(cx, cy, s.x, s.y) });
+      }
+      return preds;
+    };
+    const errOf = (preds: { s: Sample; d: [number, number] }[], k: number) =>
+      mean(preds.map(({ s, d }) => Math.hypot(k * d[0] - s.dx, k * d[1] - s.dy)));
+
+    const defaultErr = errOf(cvPreds(DEFAULT_PARAMS.smooth), DEFAULT_PARAMS.strength);
     let best: Params = { ...DEFAULT_PARAMS };
     let bestErr = defaultErr;
-    for (const sigS of [40, 70, 120]) {
-      for (const sigA of [0, 0.35, 0.7]) {
-        for (const sigK of [0, 0.003, 0.008]) {
-          const preds = predsFor({ sigS, sigA, sigK, strength: 1 });
-          for (const strength of [0.5, 0.75, 1, 1.25]) {
-            const e = cvErr(strength, preds);
-            if (e < bestErr) {
-              bestErr = e;
-              best = { sigS, sigA, sigK, strength };
-            }
-          }
+    for (const smooth of SMOOTH_GRID) {
+      const preds = cvPreds(smooth);
+      for (const strength of STRENGTH_GRID) {
+        const e = errOf(preds, strength);
+        if (e < bestErr) {
+          bestErr = e;
+          best = { smooth, strength };
         }
       }
     }
     this.params = best;
+    this.fit();
     this.save();
     return { trials: this.trials.length, before, defaultErr, after: bestErr, params: best };
   }
@@ -283,7 +478,34 @@ export class WarpField {
   }
 }
 
-/* ================================================================ 幾何 */
+/* ================================================================ 数値計算・幾何 */
+
+function cholesky(M: Float64Array, n: number): Float64Array {
+  const L = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = M[i * n + j];
+      for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
+      L[i * n + j] = i === j ? Math.sqrt(Math.max(s, 1e-12)) : s / L[j * n + j];
+    }
+  }
+  return L;
+}
+function cholSolve(L: Float64Array, n: number, b: Float64Array): Float64Array {
+  const y = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = b[i];
+    for (let k = 0; k < i; k++) s -= L[i * n + k] * y[k];
+    y[i] = s / L[i * n + i];
+  }
+  const x = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = y[i];
+    for (let k = i + 1; k < n; k++) s -= L[k * n + i] * x[k];
+    x[i] = s / L[i * n + i];
+  }
+  return x;
+}
 
 function mean(a: number[]): number {
   return a.length ? a.reduce((s, v) => s + v, 0) / a.length : NaN;
@@ -320,37 +542,7 @@ function meanDist(pts: Pt[], path: Pt[]): number {
   );
 }
 
-/** 直近の点から進行方向と曲率を求める（因果的）。beta は方向の確からしさ 0..1。 */
-function featureAt(pts: Pt[], i: number): Feat {
-  const p = pts[i];
-  const back = (from: Pt, start: number, dist: number) => {
-    for (let j = start; j >= 0; j--) if (Math.hypot(from.x - pts[j].x, from.y - pts[j].y) >= dist) return j;
-    return -1;
-  };
-  const j1 = back(p, i - 1, DIR_DIST);
-  if (j1 < 0) {
-    if (i === 0) return { a: null, k: 0, beta: 0 };
-    const d = Math.hypot(p.x - pts[0].x, p.y - pts[0].y);
-    if (d < 1) return { a: null, k: 0, beta: 0 };
-    return { a: Math.atan2(p.y - pts[0].y, p.x - pts[0].x), k: 0, beta: Math.min(1, d / DIR_DIST) };
-  }
-  const a = Math.atan2(p.y - pts[j1].y, p.x - pts[j1].x);
-  // 曲率: 直近 CURV_DIST の弦と、その手前 CURV_DIST の弦の向きの差 / 長さ
-  let k = 0;
-  const c1 = back(p, i - 1, CURV_DIST);
-  if (c1 >= 0) {
-    const q = pts[c1];
-    const c2 = back(q, c1 - 1, CURV_DIST);
-    if (c2 >= 0) {
-      const r = pts[c2];
-      const L = (Math.hypot(p.x - q.x, p.y - q.y) + Math.hypot(q.x - r.x, q.y - r.y)) / 2;
-      k = wrap(Math.atan2(p.y - q.y, p.x - q.x) - Math.atan2(q.y - r.y, q.x - r.x)) / L;
-    }
-  }
-  return { a, k, beta: 1 };
-}
-
-type Match = { p: Pt; q: Pt; f: Feat; tx: number; ty: number; curv: number; u: number };
+type Match = { p: Pt; q: Pt; tx: number; ty: number; curv: number; u: number };
 
 /**
  * なぞった軌跡の各点を、経路上の対応点に「進行に沿って単調に」対応付ける。
@@ -363,8 +555,7 @@ function matchTrial(t: Trial): Match[] {
   let idx = 0;
   let last: Pt | null = null;
   const WINDOW = 40; // 1 点あたり先読みする経路頂点数（≈80px）
-  for (let i = 0; i < t.raw.length; i++) {
-    const p = t.raw[i];
+  for (const p of t.raw) {
     // 対応点は全点で追う（単調性のため）が、サンプルは SAMPLE_STEP ごとに出す
     let best = idx;
     let bd = Infinity;
@@ -393,7 +584,7 @@ function matchTrial(t: Trial): Match[] {
       const tb = Math.atan2(path[k1].y - path[idx].y, path[k1].x - path[idx].x);
       curv = wrap(tb - ta) / (Math.hypot(path[k1].x - path[k0].x, path[k1].y - path[k0].y) / 2 || 1);
     }
-    out.push({ p, q: path[idx], f: featureAt(t.raw, i), tx, ty, curv, u: idx / Math.max(1, n - 1) });
+    out.push({ p, q: path[idx], tx, ty, curv, u: idx / Math.max(1, n - 1) });
   }
   return out;
 }

@@ -415,6 +415,12 @@ body {
   cursor: grab !important;
 }
 
+/* D 長押し（回転モード） */
+.canvas-viewport.rotate-mode,
+.canvas-viewport.rotate-mode canvas {
+  cursor: alias !important;
+}
+
 .canvas-viewport.pan-mode:active,
 .canvas-viewport.pan-mode canvas:active {
   cursor: grabbing !important;
@@ -3166,4 +3172,62 @@ button.active {
 .warp-calib-actions .primary {
   background: var(--accent);
   color: #fff;
+}
+
+/* ---- 補正の効果テスト（WarpTest） ---- */
+.warp-test-result {
+  max-height: 86vh;
+  overflow-y: auto;
+  width: min(900px, 94vw);
+  max-width: none;
+}
+.warp-test-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.warp-test-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.warp-test-table th,
+.warp-test-table td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+}
+.warp-test-table th:first-child,
+.warp-test-table td:first-child {
+  text-align: left;
+}
+.warp-test-rating {
+  display: flex;
+  gap: 6px;
+}
+.warp-test-rating button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 92px;
+  padding: 6px 4px;
+  font-size: 11px;
+}
+.warp-test-rating button b {
+  font-size: 16px;
+}
+.warp-test-rot {
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+.warp-strength-input {
+  width: 64px;
+}
+.warp-disp {
+  line-height: 1.6;
+}
+.warp-warn {
+  color: #ff9f0a;
 }
