@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { KIND_LABEL, type OptResult, type PathKind, type Pt, type Tendency, type WarpField } from './warpField';
+import { WARP_METHOD_LABEL, type WarpMethod } from './warpMethod';
 import { genPath, resample } from './warpPaths';
 
 /**
@@ -10,6 +11,16 @@ import { genPath, resample } from './warpPaths';
  * 経路がユーザの「理想の線」になるので、なぞった軌跡とのズレを WarpField に学習させる。
  * 1 セット終わるごとに、ズレ方の傾向を集計し、補正のかけ方（カーネル幅・強さ）を最適化する。
  * キャンバスには一切描かない。ガイドはキャンバスが見えている範囲に出す。
+ * 学習中は補正をかけず、手の動きそのまま（補正なし）の線を表示する。学習に使うのも補正前の軌跡。
+ *
+ * 目標線・描いた線はキャンバス座標で持ち、「画面 = T + z·R(θ)·キャンバス」で写して表示する。
+ *
+ * 実験方式ごとの違い:
+ *   方式A（キャンバス固定・視点操作なし）: 視点操作は使えない。目標線と軌跡をキャンバス座標で学習する。
+ *   方式B（入力座標系固定・視点操作あり）: 視点操作（Space / 中ボタン＝移動、Z＋上下ドラッグ・
+ *     Ctrl＋ホイール＝ズーム、D＋ドラッグ＝回転、ホイール＝移動）が使える。目標線と軌跡を
+ *     画面の入力座標（clientX/Y）で学習する。1 本描いている間は視点が変わらないので、
+ *     その時点の目標線を画面座標に写せば、手の動きと同じ座標系で比べられる。
  * 場はキャンバス座標で持つので、画面座標 ⇄ キャンバス座標を map で変換して渡す。
  * 経路は短いと局所的に極端な歪みを学習しやすいので、見えている範囲に対して長めに取る。
  */
@@ -18,7 +29,13 @@ import { genPath, resample } from './warpPaths';
 export type CalibArea = { left: number; top: number; width: number; height: number };
 export type CalibMap = { left: number; top: number; scale: number };
 type Trial = { kind: PathKind; rawErr: number; shownErr: number };
-type Guide = { kind: PathKind; path: Pt[] };
+type Guide = { kind: PathKind; path: Pt[] }; // path はキャンバス座標
+/** 表示: 画面座標 = (tx, ty) + z · R(rot) · キャンバス座標 */
+type View = { tx: number; ty: number; z: number; rot: number };
+type ViewGesture = { mode: 'pan' | 'zoom' | 'rot'; sx: number; sy: number; v0: View; startAngle: number; px: number; py: number };
+const ZOOM_MIN = 0.1;
+const ZOOM_MAX = 8;
+const BAR_H = 52; // 上部バーの高さ（目標線をここに重ねない）
 
 const BLOCK = 21; // 1 セットの試行数（3 種類 × 7）
 const MARGIN = 40;
@@ -42,14 +59,27 @@ export function WarpCalibration({
   warp,
   area,
   map,
+  docSize,
+  method,
   onClose,
 }: {
+  /** 学習先の場（方式A＝キャンバス座標の場、方式B＝画面座標の場） */
   warp: WarpField;
+  method: WarpMethod;
   area: CalibArea;
   map: CalibMap;
+  /** キャンバスの大きさ（紙として描く範囲） */
+  docSize: { width: number; height: number };
   onClose: (trials: number) => void;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const cvRef = useRef<HTMLCanvasElement>(null);
+  // 視点（開始時はエディタと同じ見え方）と視点操作の状態
+  const viewRef = useRef<View>({ tx: map.left, ty: map.top, z: 1 / map.scale, rot: 0 });
+  const keysRef = useRef({ space: false, zoom: false, rot: false });
+  const gestureRef = useRef<ViewGesture | null>(null);
+  const strokeDocRef = useRef<Pt[]>([]); // 描いている線（キャンバス座標）。視点を変えたときの描き直し用
+  const [, rerender] = useState(0);
   const guideRef = useRef<Guide | null>(null);
   const strokeRef = useRef<{ rx: number; ry: number; sx: number; sy: number } | null>(null);
   const busyRef = useRef(false);
@@ -79,37 +109,77 @@ export function WarpCalibration({
     return kindQueueRef.current.pop()!;
   };
 
+  /* ------------------------------------------------------------ 座標（視点） */
+
+  const toClient = (p: Pt): Pt => {
+    const v = viewRef.current;
+    const th = (v.rot * Math.PI) / 180;
+    const c = Math.cos(th);
+    const s = Math.sin(th);
+    return { x: v.tx + v.z * (p.x * c - p.y * s), y: v.ty + v.z * (p.x * s + p.y * c) };
+  };
+  const toDoc = (p: Pt): Pt => {
+    const v = viewRef.current;
+    const th = (-v.rot * Math.PI) / 180;
+    const c = Math.cos(th);
+    const s = Math.sin(th);
+    const dx = p.x - v.tx;
+    const dy = p.y - v.ty;
+    return { x: (dx * c - dy * s) / v.z, y: (dx * s + dy * c) / v.z };
+  };
+
   const newGuide = () => {
-    // キャンバスの見えている範囲（画面内に収まる部分）に経路を置く
-    const L = Math.max(area.left, 0) + MARGIN;
-    const T = Math.max(area.top, 0) + MARGIN;
-    const R = Math.min(area.left + area.width, window.innerWidth) - MARGIN;
-    const B = Math.min(area.top + area.height, window.innerHeight) - MARGIN;
+    // いま画面に見えているキャンバスの範囲に経路を置く。
+    // 最初の 1 本はエディタで見えていた範囲（area）、以降は画面内でキャンバスの上に収まる範囲。
+    const first = !guideRef.current;
+    const L = (first ? Math.max(area.left, 0) : 0) + MARGIN;
+    const T = (first ? Math.max(area.top, 0) : BAR_H) + MARGIN;
+    const R = (first ? Math.min(area.left + area.width, window.innerWidth) : window.innerWidth) - MARGIN;
+    const B = (first ? Math.min(area.top + area.height, window.innerHeight) : window.innerHeight) - MARGIN;
     const w = Math.max(R - L, 60);
     const h = Math.max(B - T, 60);
-    const inside = (p: Pt) => p.x >= L && p.x <= L + w && p.y >= T && p.y <= T + h;
+    const onScreen = (p: Pt) => p.x >= L && p.x <= L + w && p.y >= T && p.y <= T + h;
+    const onPaper = (q: Pt) => q.x >= 0 && q.x <= docSize.width && q.y >= 0 && q.y <= docSize.height;
     const kind = nextKind();
-    for (let k = 0; k < 200; k++) {
+    for (let k = 0; k < 300; k++) {
       const path = genPath(kind, L, T, w, h);
-      if (path.every(inside)) {
-        guideRef.current = { kind, path };
+      if (!path.every(onScreen)) continue;
+      const doc = path.map(toDoc);
+      if (doc.every(onPaper)) {
+        guideRef.current = { kind, path: doc };
         return;
       }
     }
-    const cy = T + h / 2;
-    guideRef.current = { kind: 'line', path: resample([{ x: L, y: cy }, { x: L + w, y: cy }]) };
+    // 収まる経路が作れない（キャンバスがほとんど見えていない等）ときは、キャンバス中央の横線
+    const cy = docSize.height / 2;
+    guideRef.current = {
+      kind: 'line',
+      path: resample([
+        { x: docSize.width * 0.2, y: cy },
+        { x: docSize.width * 0.8, y: cy },
+      ]),
+    };
   };
 
   const drawScene = () => {
     const c = ctx();
     if (!c) return;
     c.clearRect(0, 0, window.innerWidth, window.innerHeight);
-    // 対象範囲（キャンバスの見えている部分）を紙として塗る
+    // 紙（キャンバス全体。回転・ズームに合わせて写す）
+    const corners = [
+      { x: 0, y: 0 },
+      { x: docSize.width, y: 0 },
+      { x: docSize.width, y: docSize.height },
+      { x: 0, y: docSize.height },
+    ].map(toClient);
     c.fillStyle = '#fff';
-    c.fillRect(area.left, area.top, area.width, area.height);
+    c.beginPath();
+    corners.forEach((q, i) => (i ? c.lineTo(q.x, q.y) : c.moveTo(q.x, q.y)));
+    c.closePath();
+    c.fill();
     const g = guideRef.current;
     if (!g || finishedRef.current) return;
-    const p = g.path;
+    const p = g.path.map(toClient);
     c.lineCap = 'round';
     c.lineJoin = 'round';
     c.strokeStyle = 'rgba(0,150,255,.3)';
@@ -142,6 +212,16 @@ export function WarpCalibration({
     c.beginPath();
     c.arc(e.x, e.y, 7, 0, Math.PI * 2);
     c.stroke();
+    // 描いている途中・描き終えた直後の線（補正なし）
+    const sd = strokeDocRef.current;
+    if (sd.length > 1) {
+      const q = sd.map(toClient);
+      c.strokeStyle = '#111';
+      c.lineWidth = 2.5;
+      c.beginPath();
+      q.forEach((r, j) => (j ? c.lineTo(r.x, r.y) : c.moveTo(r.x, r.y)));
+      c.stroke();
+    }
   };
 
   // キャンバスの初期化（画面サイズ × DPR）
@@ -188,30 +268,144 @@ export function WarpCalibration({
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       e.stopImmediatePropagation();
+      if (setViewKeyRef.current(e, true)) return;
       if (e.key === 'Escape') closeRef.current();
     };
+    const up = (e: KeyboardEvent) => {
+      e.stopImmediatePropagation();
+      setViewKeyRef.current(e, false);
+    };
+    const blur = () => {
+      keysRef.current = { space: false, zoom: false, rot: false };
+      updateCursorStyle();
+    };
     window.addEventListener('keydown', h, true);
-    return () => window.removeEventListener('keydown', h, true);
+    window.addEventListener('keyup', up, true);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', h, true);
+      window.removeEventListener('keyup', up, true);
+      window.removeEventListener('blur', blur);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const toDoc = (p: Pt): Pt => ({ x: (p.x - map.left) * map.scale, y: (p.y - map.top) * map.scale });
+  /* ------------------------------------------------------------ 視点操作（エディタと同じキー） */
+
+  /** Space / Z / D の押下状態を更新。視点操作のキーなら true。 */
+  const viewLocked = method === 'A'; // 方式A では視点操作を使わない
+  const setViewKey = (e: KeyboardEvent, down: boolean): boolean => {
+    if (viewLocked) return false;
+    if (down && (e.ctrlKey || e.metaKey)) return false;
+    const k = keysRef.current;
+    let hit = true;
+    if (e.key === ' ') {
+      k.space = down;
+      e.preventDefault();
+    } else if (e.key === 'z' || e.key === 'Z' || e.code === 'KeyZ') k.zoom = down;
+    else if (e.key === 'd' || e.key === 'D' || e.code === 'KeyD') k.rot = down;
+    else hit = false;
+    if (hit) updateCursorStyle();
+    return hit;
+  };
+  const setViewKeyRef = useRef(setViewKey);
+  setViewKeyRef.current = setViewKey;
+  const updateCursorStyle = () => {
+    const cv = cvRef.current;
+    if (!cv) return;
+    const k = keysRef.current;
+    cv.style.cursor = k.space ? 'grab' : k.zoom ? 'ns-resize' : k.rot ? 'alias' : 'crosshair';
+  };
+  const redraw = () => {
+    drawScene();
+    rerender((x) => x + 1);
+  };
+  const startGesture = (mode: ViewGesture['mode'], e: ReactPointerEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* 捕捉できなくても続行 */
+    }
+    const px = window.innerWidth / 2; // 回転の軸＝画面中央（エディタと同じ）
+    const py = window.innerHeight / 2;
+    gestureRef.current = {
+      mode,
+      sx: e.clientX,
+      sy: e.clientY,
+      v0: { ...viewRef.current },
+      startAngle: Math.atan2(e.clientY - py, e.clientX - px),
+      px,
+      py,
+    };
+  };
+  /** 画面上の点 (ax, ay) を動かさずにズーム。 */
+  const zoomAround = (v0: View, z1: number, ax: number, ay: number): View => {
+    const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z1));
+    const k = z / v0.z;
+    return { ...v0, z, tx: ax - (ax - v0.tx) * k, ty: ay - (ay - v0.ty) * k };
+  };
+  /** 画面上の点 (px, py) を動かさずに回転を deg に。 */
+  const rotateAround = (v0: View, deg: number, px: number, py: number): View => {
+    const d = ((deg - v0.rot) * Math.PI) / 180;
+    const rx = v0.tx - px;
+    const ry = v0.ty - py;
+    return { ...v0, rot: deg, tx: px + rx * Math.cos(d) - ry * Math.sin(d), ty: py + rx * Math.sin(d) + ry * Math.cos(d) };
+  };
+  const moveGesture = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    const g = gestureRef.current!;
+    if (g.mode === 'pan') {
+      viewRef.current = { ...g.v0, tx: g.v0.tx + (e.clientX - g.sx), ty: g.v0.ty + (e.clientY - g.sy) };
+    } else if (g.mode === 'zoom') {
+      viewRef.current = zoomAround(g.v0, g.v0.z * Math.pow(1.01, g.sy - e.clientY), g.sx, g.sy);
+    } else {
+      let deg = g.v0.rot + ((Math.atan2(e.clientY - g.py, e.clientX - g.px) - g.startAngle) * 180) / Math.PI;
+      deg = ((((deg + 180) % 360) + 360) % 360) - 180;
+      if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+      else if (Math.abs(deg) < 1.5) deg = 0;
+      viewRef.current = rotateAround(g.v0, deg, g.px, g.py);
+    }
+    redraw();
+  };
+  const resetRotation = () => {
+    if (strokeRef.current) return;
+    viewRef.current = rotateAround(viewRef.current, 0, window.innerWidth / 2, window.innerHeight / 2);
+    redraw();
+  };
+
+  // ホイール: Ctrl/⌘ ＋ ホイール＝ズーム、ホイールのみ＝移動
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (viewLocked || strokeRef.current) return; // 方式A・描いている最中は動かさない
+      const v = viewRef.current;
+      viewRef.current = e.ctrlKey || e.metaKey
+        ? zoomAround(v, v.z * (e.deltaY < 0 ? 1.1 : 1 / 1.1), e.clientX, e.clientY)
+        : { ...v, tx: v.tx - e.deltaX, ty: v.ty - e.deltaY };
+      redraw();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ------------------------------------------------------------ ペン入力 */
 
   const addPoint = (x: number, y: number, pressure: number) => {
     const q = toDoc({ x, y });
-    const [dx, dy] = warp.feed(q.x, q.y); // 変位はキャンバス px → 画面 px に戻して表示
-    const sx = x + dx / map.scale;
-    const sy = y + dy / map.scale;
+    // 補正前の軌跡を学習用に記録する（戻り値の変位は使わない＝学習中は補正なしで表示する）。
+    // 方式A はキャンバス座標、方式B は画面の入力座標で記録する。
+    if (method === 'A') warp.feed(q.x, q.y);
+    else warp.feed(x, y);
+    const sx = x;
+    const sy = y;
     const s = strokeRef.current;
     const c = ctx();
     if (s && c) {
       c.lineCap = 'round';
-      c.strokeStyle = 'rgba(230,60,60,.45)'; // 実際の手の軌跡
-      c.lineWidth = 1.5;
-      c.beginPath();
-      c.moveTo(s.rx, s.ry);
-      c.lineTo(x, y);
-      c.stroke();
-      c.strokeStyle = '#111'; // 補正後に表示される線
+      c.strokeStyle = '#111'; // 手の動きそのままの線（補正なし）
       c.lineWidth = 1 + 4 * pressure;
       c.beginPath();
       c.moveTo(s.sx, s.sy);
@@ -219,11 +413,19 @@ export function WarpCalibration({
       c.stroke();
     }
     strokeRef.current = { rx: x, ry: y, sx, sy };
+    strokeDocRef.current.push(q);
   };
   const pressureOf = (e: PointerEvent | ReactPointerEvent) =>
     e.pointerType === 'mouse' ? 0.5 : e.pressure > 0 ? e.pressure : 0.5;
 
   const onDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (strokeRef.current || gestureRef.current) return;
+    // 視点操作は描画より優先（いつでも使える）
+    const k = keysRef.current;
+    if (viewLocked && e.button === 1) return; // 方式A: 中ボタンのパンは無効
+    if (e.button === 1 || k.space) return startGesture('pan', e);
+    if (k.zoom) return startGesture('zoom', e);
+    if (k.rot) return startGesture('rot', e);
     if (busyRef.current || finishedRef.current || e.button !== 0) return;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -232,23 +434,35 @@ export function WarpCalibration({
     }
     warp.begin();
     strokeRef.current = null;
+    strokeDocRef.current = [];
     addPoint(e.clientX, e.clientY, pressureOf(e));
   };
   const onMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (gestureRef.current) {
+      moveGesture(e);
+      return;
+    }
     if (!strokeRef.current) return;
     const n = e.nativeEvent;
     const evs = typeof n.getCoalescedEvents === 'function' ? n.getCoalescedEvents() : [];
     for (const ev of evs.length ? evs : [n]) addPoint(ev.clientX, ev.clientY, pressureOf(ev));
   };
   const onUp = () => {
+    if (gestureRef.current) {
+      gestureRef.current = null;
+      return;
+    }
     if (!strokeRef.current) return;
     strokeRef.current = null;
     const g = guideRef.current!;
-    const r = warp.endTrace(g.path.map(toDoc), g.kind);
+    // 方式A: 目標線も軌跡もキャンバス座標。
+    // 方式B: 目標線をいまの視点で画面座標に写す（描いている間は視点が変わらないので、軌跡と同じ座標系になる）。
+    const r = warp.endTrace(method === 'A' ? g.path : g.path.map(toClient), g.kind);
     busyRef.current = true;
     if (!r.ok) {
       setMsg('短すぎるため学習しませんでした（始点から終点までなぞってください）');
       setTimeout(() => {
+        strokeDocRef.current = [];
         drawScene();
         busyRef.current = false;
       }, 500);
@@ -257,8 +471,9 @@ export function WarpCalibration({
     doneRef.current += 1;
     dirtyRef.current = true;
     setTrials((t) => [...t, { kind: g.kind, rawErr: r.rawErr, shownErr: r.shownErr }]);
-    setMsg(`${KIND_LABEL[g.kind]}: 手のズレ ${f1(r.rawErr)}px → 補正後の線のズレ ${f1(r.shownErr)}px`);
+    setMsg(`${KIND_LABEL[g.kind]}: 目標線からのズレ ${f1(r.rawErr)}px（補正なし）`);
     setTimeout(() => {
+      strokeDocRef.current = [];
       if (!finishedRef.current) newGuide();
       drawScene();
       busyRef.current = false;
@@ -304,7 +519,7 @@ export function WarpCalibration({
   };
 
   return (
-    <div className="warp-calib">
+    <div className="warp-calib" ref={rootRef}>
       <canvas
         ref={cvRef}
         style={{ position: 'absolute', left: 0, top: 0, touchAction: 'none', cursor: 'crosshair' }}
@@ -320,15 +535,28 @@ export function WarpCalibration({
           {Math.min(block.length, BLOCK)} / {BLOCK} 本
         </span>
         <span className="warp-calib-msg">{msg}</span>
+        <span className="muted">{WARP_METHOD_LABEL[method]}</span>
+        {viewLocked ? (
+          <span className="muted">視点操作なし</span>
+        ) : (
+          <span
+            className="muted"
+            title="Space / 中ボタン＝移動、Z＋上下ドラッグ・Ctrl＋ホイール＝ズーム、D＋ドラッグ＝回転（Shift で 15° 刻み）"
+          >
+            {Math.round(viewRef.current.z * 100)}% ／{' '}
+            <span className="warp-test-rot" onClick={resetRotation} title="クリックで回転を 0° に戻す">
+              {Math.round(viewRef.current.rot)}°
+            </span>
+          </span>
+        )}
         <span className="muted">試行 {warp.trialCount}</span>
         <button onClick={close}>終了して描画に戻る (Esc)</button>
       </div>
       {finished && (
         <div className="warp-calib-summary">
           <div>
-            <b>{BLOCK} 本 完了</b>　手のズレ {f1(avg(block, 'rawErr'))}px → 補正後の線のズレ{' '}
-            {f1(avg(block, 'shownErr'))}px（前半 {f1(avg(block.slice(0, half), 'shownErr'))} → 後半{' '}
-            {f1(avg(block.slice(half), 'shownErr'))}）
+            <b>{BLOCK} 本 完了</b>　目標線からのズレ（補正なし）平均 {f1(avg(block, 'rawErr'))}px（前半{' '}
+            {f1(avg(block.slice(0, half), 'rawErr'))} → 後半 {f1(avg(block.slice(half), 'rawErr'))}）
           </div>
           {renderAnalysis()}
           <div className="warp-calib-actions">
@@ -338,7 +566,7 @@ export function WarpCalibration({
                 setAnalysis(null);
                 setBlockStart(trials.length);
                 newGuide();
-                setMsg('最適化した補正で続けてなぞってください');
+                setMsg('続けてなぞってください（学習中は補正なしで表示します）');
               }}
             >
               さらに {BLOCK} 本

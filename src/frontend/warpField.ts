@@ -7,7 +7,7 @@
  *
  *   D はキャンバス上に張った粗い制御格子（1 辺 CELLS マス）の各節点の変位を、3 次 B スプラインで
  *   なめらかに補間したもの。位置だけで決まる滑らかな場なので、描画中に細かく揺れない。
- *   座標はキャンバス座標（px）。
+ *   座標は場ごとに決まる（方式A＝キャンバス座標 px、方式B＝画面の入力座標 px）。
  *
  * 学習（描画とは分離）:
  *   キャリブレーションで「始点・終点・経路」を指定したガイド（直線 / 円弧 / S字）をなぞってもらう。
@@ -25,7 +25,11 @@ export type PathKind = 'line' | 'arc' | 's';
 export const KIND_LABEL: Record<PathKind, string> = { line: '直線', arc: '円弧', s: 'S字' };
 
 type Sample = { x: number; y: number; dx: number; dy: number };
-type Trial = { id: number; kind: PathKind; path: Pt[]; raw: Pt[] };
+/**
+ * 1 本分の学習データ。path・raw の座標系は場ごとに決まる（方式A＝キャンバス座標、方式B＝画面の入力座標）。
+ * rot: 以前の版で記録していた表示の回転角 [度]。現在は学習に使わない（読み込んだデータの互換のために残す）。
+ */
+type Trial = { id: number; kind: PathKind; path: Pt[]; raw: Pt[]; rot?: number };
 
 /** smooth: なめらかさ λ（大きいほど場がゆるやかに歪む）, strength: 補正の強さ */
 export type Params = { smooth: number; strength: number };
@@ -41,7 +45,10 @@ export type Tendency = {
   byDir: { deg: number; err: number }[];
 };
 
-const STORE_KEY = 'mock.warpField.v3';
+/** 方式A（キャンバス固定）の保存先。既存の学習データはこの場のもの。 */
+export const STORE_KEY_CANVAS = 'mock.warpField.v3';
+/** 方式B（入力座標系固定）の保存先。画面の入力座標で学習したデータだけを入れる。 */
+export const STORE_KEY_SCREEN = 'mock.warpField.screen.v1';
 const DEFAULT_PARAMS: Params = { smooth: 30, strength: 1 };
 const SMOOTH_GRID = [10, 30, 100, 300, 1000]; // 小さすぎる λ は局所的な歪み（描画時のブレ）の元になるので使わない
 const STRENGTH_GRID = [0.5, 0.75, 1];
@@ -84,9 +91,16 @@ export class WarpField {
   /** 学習データのあるマス（節点間隔の半分の格子）。効果テストで「学習範囲の内/外」の判定に使う。 */
   private covered = new Set<string>();
 
-  constructor() {
+  private storeKey: string;
+
+  /**
+   * storeKey: 学習データの保存先。場の座標系（キャンバス座標 / 画面の入力座標）は、
+   * setCanvas() で張る範囲と、feed()/endTrace() に渡す座標で決まる（計算の中身は共通）。
+   */
+  constructor(storeKey: string = STORE_KEY_CANVAS) {
+    this.storeKey = storeKey;
     try {
-      const d = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+      const d = JSON.parse(localStorage.getItem(this.storeKey) || 'null');
       if (d) {
         if (Array.isArray(d.trials)) this.trials = d.trials;
         if (typeof d.enabled === 'boolean') this.enabled = d.enabled;
@@ -114,7 +128,7 @@ export class WarpField {
   save(): void {
     try {
       localStorage.setItem(
-        STORE_KEY,
+        this.storeKey,
         JSON.stringify({ trials: this.trials, enabled: this.enabled, params: this.params }),
       );
     } catch {
@@ -287,13 +301,19 @@ export class WarpField {
     if (raw.length < 3 || polyLen(raw) < polyLen(path) * 0.5) return { ok: false, rawErr: 0, shownErr: 0 };
     const rawErr = meanDist(raw, path);
     const shownErr = meanDist(shown, path);
-    this.trials.push({ id: this.nextId++, kind, path: thin(path, STORE_STEP), raw: thin(raw, STORE_STEP) });
+    this.trials.push({
+      id: this.nextId++,
+      kind,
+      path: thin(path, STORE_STEP),
+      raw: thin(raw, STORE_STEP),
+    });
     if (this.trials.length > MAX_TRIALS) this.trials.splice(0, this.trials.length - MAX_TRIALS);
     this.fit();
     this.save();
     return { ok: true, rawErr, shownErr };
   }
 
+  /** 試行からサンプルを作る。位置もズレの向きも、試行を記録した座標系のまま使う。 */
   private samplesOf(t: Trial): Sample[] {
     return matchTrial(t).map((m) => ({ x: m.p.x, y: m.p.y, dx: m.q.x - m.p.x, dy: m.q.y - m.p.y }));
   }

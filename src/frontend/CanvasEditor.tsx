@@ -111,7 +111,14 @@ import { bufferToDataURL } from './thumbnail';
 import { reorderIndex } from './layerDnd';
 import { ColorPicker } from './ColorPicker';
 import { FloatWindow, Section } from './Float';
-import { WarpField } from './warpField';
+import { WarpField, STORE_KEY_CANVAS, STORE_KEY_SCREEN } from './warpField';
+import {
+  WARP_METHOD_HINT,
+  WARP_METHOD_LABEL,
+  loadWarpMethod,
+  saveWarpMethod,
+  type WarpMethod,
+} from './warpMethod';
 import { WarpCalibration, type CalibArea, type CalibMap } from './WarpCalibration';
 import { WarpTest } from './WarpTest';
 import { ToolIcon, type ToolIconName } from './ToolIcon';
@@ -589,7 +596,17 @@ export function CanvasEditor({
   const [hovering, setHovering] = useState(false);
   // 場のゆがみ補正: 「描きたい線」と「実際に引ける線」のズレを学習し、ブラシ入力をゆがめて補正する。
   // 学習はキャリブレーション（ガイドをなぞるタスク）で行い、キャンバスへの描画では学習しない。
-  const [warp] = useState(() => new WarpField());
+  // 実験方式ごとに別の場を持つ（warpMethod.ts）。
+  //   方式A: キャンバス座標の場（既存の学習データ）。方式B: 画面の入力座標の場（方式B で学習したデータだけ）。
+  const [warpA] = useState(() => new WarpField(STORE_KEY_CANVAS));
+  const [warpB] = useState(() => new WarpField(STORE_KEY_SCREEN));
+  const [warpMethod, setWarpMethodState] = useState<WarpMethod>(loadWarpMethod);
+  const methodRef = useRef(warpMethod);
+  methodRef.current = warpMethod;
+  const warp = warpMethod === 'A' ? warpA : warpB; // いま選んでいる方式の場
+  const viewLocked = warpMethod === 'A'; // 方式A では回転・パン・ズームを使わない
+  const warpScreenGridRef = useRef<HTMLCanvasElement>(null); // 方式B の碁盤表示（画面に固定）
+  const [vpSize, setVpSize] = useState({ w: window.innerWidth, h: window.innerHeight });
   const [warpOn, setWarpOn] = useState(warp.enabled);
   const [warpStrength, setWarpStrength] = useState(warp.strength);
   const [warpCount, setWarpCount] = useState(warp.count);
@@ -1231,6 +1248,7 @@ export function CanvasEditor({
     if (!vp) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      if (methodRef.current === 'A') return; // 方式A: 視点操作なし
       if (e.ctrlKey || e.metaKey) {
         zoomToAnchor(zoomRef.current * (e.deltaY < 0 ? 1.1 : 1 / 1.1), e.clientX, e.clientY);
       } else {
@@ -1295,30 +1313,80 @@ export function CanvasEditor({
     });
   };
 
+  /** 場の変位（補正 OFF なら 0）。描画（feed）と碁盤表示で同じ値になる。 */
+  const warpDisp = (f: WarpField, x: number, y: number): [number, number] =>
+    f.enabled ? f.displacementAt(x, y) : [0, 0];
+
   /**
-   * 場の変位を、いまの表示の回転に合わせて向きを直す。場は回転 0° のキャリブレーションで学習しているので
-   * 変位は「画面上の向き」。手のクセも画面（＝タブレット）上の向きに付くため、表示を θ 回しているときは
-   * 変位を −θ 回してからキャンバス座標に足す。
+   * 入力位置（画面の clientX/Y）→ 補正後のキャンバス座標。描画も碁盤表示もこの規則に従う。
+   *   方式A: いったんキャンバス座標 p に直し、キャンバス座標の場の変位（キャンバス px）を足す。
+   *   方式B: 画面の入力位置 c に画面座標の場の変位（画面 px）を足してから、キャンバス座標に直す。
+   *          回転・パン・ズームは最後の変換（toCanvas）にしか入らないので、同じ画面位置には同じ変位がかかる。
+   * record=true のときは feed() を通す（直前の線の変位として集計される。値は warpDisp と同じ）。
    */
-  const rotateDisp = (dx: number, dy: number): [number, number] => {
-    if (rotRef.current === 0) return [dx, dy];
-    const th = (-rotRef.current * Math.PI) / 180;
-    return [dx * Math.cos(th) - dy * Math.sin(th), dx * Math.sin(th) + dy * Math.cos(th)];
+  const warpedCanvasPoint = (
+    cx: number,
+    cy: number,
+    toCanvas: (x: number, y: number) => [number, number],
+    record: boolean,
+  ): [number, number] => {
+    if (methodRef.current === 'B') {
+      const [dx, dy] = record ? warpB.feed(cx, cy) : warpDisp(warpB, cx, cy);
+      return toCanvas(cx + dx, cy + dy);
+    }
+    const [x, y] = toCanvas(cx, cy);
+    const [dx, dy] = record ? warpA.feed(x, y) : warpDisp(warpA, x, y);
+    return [x + dx, y + dy];
   };
 
-  /** ブラシ入力点を場のゆがみで補正する（場はキャンバス座標で持つ）。 */
-  const warpPoints = (pts: StrokePoint[]): StrokePoint[] =>
-    pts.map((p) => {
-      const [dx, dy] = rotateDisp(...warp.feed(p.x, p.y));
-      return dx === 0 && dy === 0 ? p : { ...p, x: p.x + dx, y: p.y + dy };
+  /** ブラシ入力点（補正後のキャンバス座標）。coalesced=true なら間引かれた中間サンプルも全部。 */
+  const getWarpedPoints = (e: ReactPointerEvent, coalesced: boolean): StrokePoint[] => {
+    const native = e.nativeEvent;
+    const evs = coalesced && typeof native.getCoalescedEvents === 'function' ? native.getCoalescedEvents() : [];
+    const toCanvas = clientToCanvasFn(); // 矩形取得は1イベント1回だけ
+    return (evs.length ? evs : [native]).map((ev) => {
+      const [x, y] = warpedCanvasPoint(ev.clientX, ev.clientY, toCanvas, true);
+      return { x, y, pressure: ev.pointerType === 'mouse' ? 1 : ev.pressure > 0 ? ev.pressure : 0.5 };
     });
+  };
 
-  // 変形範囲＝キャンバス。サイズが変わったら制御格子を張り直す。
+  // 方式A の場の範囲＝キャンバス。サイズが変わったら制御格子を張り直す。
   useEffect(() => {
-    warp.setCanvas(width, height);
+    warpA.setCanvas(width, height);
     setWarpCount(warp.count);
     setWarpVer((v) => v + 1);
-  }, [warp, width, height]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [warpA, width, height]);
+
+  // 方式B の場の範囲＝ブラウザの表示領域（clientX/Y の範囲）。ウィンドウの大きさが変わったら張り直す。
+  useEffect(() => {
+    const onResize = () => {
+      warpB.setCanvas(window.innerWidth, window.innerHeight);
+      setVpSize({ w: window.innerWidth, h: window.innerHeight });
+      setWarpVer((v) => v + 1);
+    };
+    onResize();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [warpB]);
+
+  // 方式を切り替えたら、表示している設定（ON/OFF・強さ・学習数・直前の線）をその方式の場に合わせる
+  useEffect(() => {
+    setWarpOn(warp.enabled);
+    setWarpStrength(warp.strength);
+    setWarpCount(warp.count);
+    setWarpLast(warp.lastStroke);
+    setWarpVer((v) => v + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [warpMethod]);
+
+  const changeWarpMethod = (m: WarpMethod) => {
+    if (m === warpMethod) return;
+    saveWarpMethod(m);
+    setWarpMethodState(m);
+    if (m === 'A' && rotRef.current !== 0) rotateTo(0); // 方式A は回転なしで使う
+    setWarpMsg(`実験方式を ${WARP_METHOD_LABEL[m]} にしました`);
+  };
 
   // 場のゆがみを碁盤の目で表示。各交点を「そこにペンを置いたら線が出る位置」へ動かして描く。
   useEffect(() => {
@@ -1326,12 +1394,13 @@ export function CanvasEditor({
     if (!c) return;
     const g = c.getContext('2d')!;
     g.clearRect(0, 0, c.width, c.height);
-    if (!showWarpGrid) return;
+    if (!showWarpGrid || warpMethod !== 'A') return; // 方式A: キャンバス上に描く（方式B は画面に固定した格子）
     const step = Math.min(width, height) / 18; // 19 路盤の目の細かさ
     const sub = step / 4;
-    const ex = warpOn ? (warpGridExag ? 4 : 1) : 0;
+    const ex = warpGridExag ? 4 : 1;
+    // 描画と同じ規則（warpedCanvasPoint の方式A と同じ：キャンバス座標 + キャンバス座標の変位）
     const P = (x: number, y: number): [number, number] => {
-      const [dx, dy] = rotateDisp(...warp.displacementAt(x, y)); // 描画時と同じく回転に合わせる
+      const [dx, dy] = warpDisp(warpA, x, y);
       return [x + ex * dx, y + ex * dy];
     };
     const lw = 1 / zoom; // 画面上で約 1px
@@ -1361,11 +1430,60 @@ export function CanvasEditor({
       for (let x = sub; x <= width + 0.5; x += sub) g.lineTo(...P(Math.min(x, width), y));
     }
     g.stroke();
-  }, [warp, showWarpGrid, warpGridExag, warpOn, warpStrength, warpCount, warpVer, width, height, zoom, rotation]);
+  }, [warpMethod, showWarpGrid, warpGridExag, warpOn, warpStrength, warpCount, warpVer, width, height, zoom, rotation]);
+
+  // 方式B の碁盤表示：画面（ブラウザの表示領域）に固定した格子。各交点を「その画面位置にペンを置いたら
+  // 線が出る画面位置」へ動かして描く。描画と同じ規則（画面座標 + 画面座標の変位）なので、視点を変えても動かない。
+  useEffect(() => {
+    const c = warpScreenGridRef.current;
+    if (!c) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = Math.round(vpSize.w * dpr);
+    c.height = Math.round(vpSize.h * dpr);
+    c.style.width = `${vpSize.w}px`;
+    c.style.height = `${vpSize.h}px`;
+    const g = c.getContext('2d')!;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, vpSize.w, vpSize.h);
+    if (!showWarpGrid || warpMethod !== 'B') return;
+    const r = c.getBoundingClientRect(); // client 座標 → この canvas 内の座標
+    const step = Math.min(vpSize.w, vpSize.h) / 18;
+    const sub = step / 4;
+    const ex = warpGridExag ? 4 : 1;
+    const P = (cx: number, cy: number): [number, number] => {
+      const [dx, dy] = warpDisp(warpB, cx, cy);
+      return [cx + ex * dx - r.left, cy + ex * dy - r.top];
+    };
+    g.strokeStyle = 'rgba(255,255,255,.18)';
+    g.lineWidth = 1;
+    g.beginPath();
+    for (let x = 0; x <= vpSize.w + 0.5; x += step) {
+      g.moveTo(x - r.left, -r.top);
+      g.lineTo(x - r.left, vpSize.h - r.top);
+    }
+    for (let y = 0; y <= vpSize.h + 0.5; y += step) {
+      g.moveTo(-r.left, y - r.top);
+      g.lineTo(vpSize.w - r.left, y - r.top);
+    }
+    g.stroke();
+    g.strokeStyle = 'rgba(215,70,30,.85)';
+    g.lineWidth = 1.5;
+    g.beginPath();
+    for (let x = 0; x <= vpSize.w + 0.5; x += step) {
+      g.moveTo(...P(x, 0));
+      for (let y = sub; y <= vpSize.h + 0.5; y += sub) g.lineTo(...P(x, Math.min(y, vpSize.h)));
+    }
+    for (let y = 0; y <= vpSize.h + 0.5; y += step) {
+      g.moveTo(...P(0, y));
+      for (let x = sub; x <= vpSize.w + 0.5; x += sub) g.lineTo(...P(Math.min(x, vpSize.w), y));
+    }
+    g.stroke();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [warpMethod, showWarpGrid, warpGridExag, warpOn, warpStrength, warpCount, warpVer, vpSize]);
 
   // 場の大きさ（強さ 1 のとき）と、格子が折り返さない強さの上限。強さはここに掛けて表示する。
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const warpStats = useMemo(() => warp.fieldStats(), [warp, warpCount, warpVer, width, height]);
+  const warpStats = useMemo(() => warp.fieldStats(), [warp, warpCount, warpVer, width, height, vpSize]);
   /** 強さのスライダーと入力欄の共通処理。0 = 補正なしと同じ。 */
   const setWarpStrengthValue = (v: number) => {
     if (!Number.isFinite(v)) return;
@@ -2015,6 +2133,7 @@ export function CanvasEditor({
   // canvas に張り、以後の move/up は既存の canvas ハンドラ（panningRef/zoomDragRef 分岐）がそのまま処理する。
   const onViewportPointerDown = (e: ReactPointerEvent) => {
     if (e.target === canvasRef.current) return;
+    if (viewLocked) return; // 方式A: 視点操作なし
     const startPan = () => {
       e.preventDefault();
       panningRef.current = { x: e.clientX, y: e.clientY, left: panRef.current.x, top: panRef.current.y };
@@ -2031,6 +2150,11 @@ export function CanvasEditor({
 
   const onPointerDown = (e: ReactPointerEvent) => {
     if (rightPickRef.current) return; // スポイト中は他の操作を始めない
+    // 方式A: 視点操作（中ボタン・Space・D・Z）は無効。押していても描画は始めない。
+    if (viewLocked && (e.button === 1 || spaceHeld || rotateKey || zoomKey)) {
+      e.preventDefault();
+      return;
+    }
     // 中ボタンドラッグ = パン（ツール・キャンバスが収まっているかに関係なく視点移動）。
     if (e.button === 1) {
       e.preventDefault();
@@ -2130,7 +2254,7 @@ export function CanvasEditor({
     } else {
       // brush / eraser（入力は場のゆがみで補正してから記録する）
       warp.begin();
-      const wpt = warpPoints([pt])[0];
+      const wpt = getWarpedPoints(e, false)[0];
       drawingRef.current = { strokes: [wpt] };
       // 増分プレビューを構築（ルート直下の可視リーフのみ）。不可なら従来の決定的プレビュー。
       if (buildBrushPreview(wpt)) renderBrushPreview();
@@ -2189,7 +2313,7 @@ export function CanvasEditor({
     }
     if (drawingRef.current) {
       // 1イベントにまとまった中間サンプルを全て順序通り記録（速い線のファセット解消）。
-      const pts = warpPoints(getCoalescedPoints(e));
+      const pts = getWarpedPoints(e, true);
       for (const pt of pts) {
         drawingRef.current.strokes.push(pt);
         if (brushPreviewRef.current) advanceBrush(pt); // 新区間だけ増分スタンプ（軽い）
@@ -3705,20 +3829,23 @@ export function CanvasEditor({
       {calibArea && calibMap && overlayKind === 'test' && (
         <WarpTest
           warp={warp}
+          method={warpMethod}
           area={calibArea}
           map={calibMap}
           docSize={{ width, height }}
           onClose={() => {
             setCalibArea(null);
-            setWarpMsg('効果テストを終了しました（テスト中は学習していません）');
+            setWarpMsg('効果測定を終了しました（測定中の線は学習に使っていません）');
           }}
         />
       )}
       {calibArea && calibMap && overlayKind === 'calib' && (
         <WarpCalibration
           warp={warp}
+          method={warpMethod}
           area={calibArea}
           map={calibMap}
+          docSize={{ width, height }}
           onClose={(n) => {
             setCalibArea(null);
             setWarpVer((v) => v + 1);
@@ -3729,10 +3856,12 @@ export function CanvasEditor({
         />
       )}
       <div
-        className={`canvas-viewport ${zoomKey ? 'zoom-mode' : ''} ${spaceHeld ? 'pan-mode' : ''} ${rotateKey ? 'rotate-mode' : ''}`}
+        className={`canvas-viewport ${!viewLocked && zoomKey ? 'zoom-mode' : ''} ${!viewLocked && spaceHeld ? 'pan-mode' : ''} ${!viewLocked && rotateKey ? 'rotate-mode' : ''}`}
         ref={viewportRef}
         onPointerDown={onViewportPointerDown}
       >
+        {/* 方式B の碁盤表示（画面に固定。当たり判定は持たない） */}
+        <canvas ref={warpScreenGridRef} className="warp-screen-grid" />
         {/* stage（作業場座標系）: pan(translate) を担う外側ラッパ。ジェスチャ中は stageRef 経由で
             transform を命令的に更新し、React 再レンダーを挟まない（初期値/確定は panRef.current で描く）。
             zoom(scale) は内側 .canvas-pan が担い、pan と zoom を別レイヤーに分離する。 */}
@@ -3782,7 +3911,7 @@ export function CanvasEditor({
               className="selection-overlay warp-grid-overlay"
               width={width}
               height={height}
-              style={{ width, height, display: showWarpGrid ? 'block' : 'none' }}
+              style={{ width, height, display: showWarpGrid && warpMethod === 'A' ? 'block' : 'none' }}
             />
           </div>
         </div>
@@ -3843,20 +3972,21 @@ export function CanvasEditor({
 
       {/* キャンバス下部のフロートバー: ズーム・視点移動 */}
       <div className="float-canvasbar">
-        <button onClick={() => zoomByCenter(1 / 1.25)} title="縮小">−</button>
-        <span className="zoom-val" onClick={resetZoom} title="クリックで100%">
+        <button onClick={() => zoomByCenter(1 / 1.25)} title="縮小" disabled={viewLocked}>−</button>
+        <span className="zoom-val" onClick={() => !viewLocked && resetZoom()} title="クリックで100%">
           {Math.round(zoom * 100)}%
         </span>
-        <button onClick={() => zoomByCenter(1.25)} title="拡大">＋</button>
-        <button onClick={resetZoom}>100%</button>
-        <button onClick={fitZoom}>Fit</button>
+        <button onClick={() => zoomByCenter(1.25)} title="拡大" disabled={viewLocked}>＋</button>
+        <button onClick={resetZoom} disabled={viewLocked}>100%</button>
+        <button onClick={fitZoom} disabled={viewLocked}>Fit</button>
+        {viewLocked && <span className="keyhint-badge" title={WARP_METHOD_HINT.A}>方式A：視点操作なし</span>}
         <span className={`keyhint-badge ${zoomKey ? 'on' : ''}`} title="Z を押しながらキャンバスを上下ドラッグでズーム">
           Z＋上下ドラッグ＝ズーム
         </span>
         <span className={`keyhint-badge ${spaceHeld ? 'on' : ''}`} title="Space を押しながらドラッグで視点移動">
           Space＝視点移動
         </span>
-        <span ref={rotLabelRef} className="zoom-val" onClick={() => rotateTo(0)} title="表示の回転。クリックで 0° に戻す">
+        <span ref={rotLabelRef} className="zoom-val" onClick={() => !viewLocked && rotateTo(0)} title="表示の回転。クリックで 0° に戻す">
           {fmtDeg(rotation)}
         </span>
         <span
@@ -4036,6 +4166,22 @@ export function CanvasEditor({
         </Section>
 
         <Section title="WARP（場のゆがみ補正）" defaultOpen>
+          <div className="field warp-method">
+            <span>実験方式</span>
+            {(['A', 'B'] as WarpMethod[]).map((m) => (
+              <label key={m} title={WARP_METHOD_HINT[m]}>
+                <input type="radio" name="warp-method" checked={warpMethod === m} onChange={() => changeWarpMethod(m)} />{' '}
+                {WARP_METHOD_LABEL[m]}
+              </label>
+            ))}
+          </div>
+          <p className="hint">{WARP_METHOD_HINT[warpMethod]}</p>
+          {warpMethod === 'B' && warpB.trialCount === 0 && (
+            <p className="hint warp-warn">
+              方式B の補正はまだ学習されていません。方式Bを選んだ状態で「① 補正の学習」を行ってください
+              （方式Aの学習データは画面座標を復元できないため使えません）。
+            </p>
+          )}
           <label className="field" title="ブラシ入力を学習した場でゆがめて、描きたい線に近づける">
             <span>
               <input
@@ -4093,7 +4239,10 @@ export function CanvasEditor({
               <>
                 適用される変位（強さ {warpStrength.toFixed(2)} 倍{warpOn ? '' : '・いまは補正 OFF のため実際は 0'}）：
                 最大 <b>{(warpStats.maxDisp * warpStrength).toFixed(1)}</b> px ／ キャンバス平均{' '}
-                {(warpStats.meanDisp * warpStrength).toFixed(1)} px（キャンバス px。画面上は ×{zoom.toFixed(2)}）
+                {(warpStats.meanDisp * warpStrength).toFixed(1)} px
+                {warpMethod === 'A'
+                  ? `（キャンバス px。画面上は ×${zoom.toFixed(2)}）`
+                  : '（画面 px。回転・パン・ズームに関係なく一定）'}
                 <br />
                 格子が折り返さない強さの上限 ≈{' '}
                 {Number.isFinite(warpStats.foldStrength) ? warpStats.foldStrength.toFixed(1) : '∞'} 倍
@@ -4106,14 +4255,18 @@ export function CanvasEditor({
             )}
           </div>
           <div className="tool-row">
-            <button className="primary" onClick={() => startCalibration('calib')} title="ガイド線をなぞって手のズレを学習する">
-              キャリブレーション
+            <button
+              className="primary"
+              onClick={() => startCalibration('calib')}
+              title="① 目標線をなぞって手のズレを計測し、② 補正を作る（学習中は補正なしで表示）"
+            >
+              ① 補正の学習
             </button>
             <button
               onClick={() => startCalibration('test')}
-              title="補正あり・なしを同じお手本で描き比べ、描きやすくなったかを数値で確かめる（学習しない）"
+              title="③ 学習に使っていない目標線を、補正なし・ありで 1 回ずつ描いて比べる（学習しない）"
             >
-              効果テスト
+              ③ 効果測定
             </button>
           </div>
           <div className="tool-row">
@@ -4146,10 +4299,11 @@ export function CanvasEditor({
           )}
           {warpMsg && <p className="hint">{warpMsg}</p>}
           <p className="hint">
-            キャリブレーションで始点・終点・経路を指定したガイド（直線 / 円弧 / S字）をなぞると、手のズレを
-            学習し、キャンバス全体をなめらかなメッシュとしてゆがめます。描画中は学習せず、学習済みの場で
-            入力を補正するだけです（ブラシ / 消しゴムのみ）。碁盤の目は、各交点にペンを置いたとき線が出る
-            位置を表します。
+            ① 補正の学習：目標線（直線 / 円弧 / S字）をなぞり、手のズレを計測します（補正なしで表示）。
+            ② 補正の作成：①のデータから、キャンバス全体をなめらかにゆがめる補正を自動で作ります。
+            ③ 効果測定：①で使っていない目標線 12 本を、補正なし・ありで 1 回ずつ描いて比べます。
+            普段の描画では学習せず、学習済みの補正をかけるだけです（ブラシ / 消しゴムのみ）。碁盤の目は、
+            各交点にペンを置いたとき線が出る位置を表します。
           </p>
         </Section>
 

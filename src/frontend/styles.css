@@ -3202,22 +3202,6 @@ button.active {
 .warp-test-table td:first-child {
   text-align: left;
 }
-.warp-test-rating {
-  display: flex;
-  gap: 6px;
-}
-.warp-test-rating button {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  width: 92px;
-  padding: 6px 4px;
-  font-size: 11px;
-}
-.warp-test-rating button b {
-  font-size: 16px;
-}
 .warp-test-rot {
   cursor: pointer;
   text-decoration: underline dotted;
@@ -3230,4 +3214,30 @@ button.active {
 }
 .warp-warn {
   color: #ff9f0a;
+}
+/* 効果測定の結果表：補正なし / ありの行を色で区別 */
+.warp-test-table tr.warp-cond-off td {
+  background: rgba(255, 255, 255, 0.03);
+}
+.warp-test-table tr.warp-cond-on td {
+  background: rgba(91, 157, 255, 0.14);
+}
+/* 方式B の碁盤表示（画面に固定。ビューポート全体に重ねる） */
+.warp-screen-grid {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+.warp-method {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.warp-method label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
 }
